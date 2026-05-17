@@ -1,6 +1,6 @@
 [package]
 name = "circuit_scope"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Circuit Scope — Verilog (IEEE 1364) editor, simulator, and VCD viewer."
 license = "MIT"

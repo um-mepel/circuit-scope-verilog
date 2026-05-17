@@ -4,6 +4,7 @@ import { EditorView } from "@codemirror/view";
 import { StreamLanguage } from "@codemirror/language";
 import { verilog } from "@codemirror/legacy-modes/mode/verilog";
 import { theme } from "../ui/theme";
+import { debuggerExtension } from "./editor/debuggerExtension";
 
 type Props = {
   value: string;
@@ -16,6 +17,8 @@ type Props = {
   highlightVerilog: boolean;
   /** Editor font size in CSS px (e.g. adjusted with Cmd/Ctrl ±) */
   fontSizePx?: number;
+  /** Absolute path of the file in this editor, forwarded to the debugger extension. */
+  filePath?: string | null;
 };
 
 function createCircuitScopeEditorTheme(fontSizePx: number) {
@@ -122,13 +125,15 @@ export function VerilogEditor({
   fileKey,
   highlightVerilog,
   fontSizePx = 14,
+  filePath = null,
 }: Props) {
   const extensions = useMemo(
     () => [
       ...(highlightVerilog ? [StreamLanguage.define(verilog)] : []),
       createCircuitScopeEditorTheme(fontSizePx),
+      debuggerExtension({ filePath }),
     ],
-    [highlightVerilog, fontSizePx],
+    [highlightVerilog, fontSizePx, filePath],
   );
 
   return (

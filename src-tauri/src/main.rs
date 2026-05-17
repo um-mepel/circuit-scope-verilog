@@ -1,9 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod pty;
+mod sim_commands;
 mod vcd_viewer;
 
 use pty::{PtyManager, SessionId};
+use sim_commands::{
+    sim_driver_at, sim_end, sim_eval, sim_query_active, sim_seek, sim_start, sim_step,
+    DebuggerSessions,
+};
 use vcd_viewer::{vcd_close, vcd_find_edge, vcd_open, vcd_query, VcdSessionHolder};
 use serde::Serialize;
 use serde_json::Value;
@@ -261,6 +266,7 @@ pub fn main() {
             });
             app.manage(PtyManager::new());
             app.manage(VcdSessionHolder::default());
+            app.manage(DebuggerSessions::default());
 
             let handle = app.handle().clone();
             // On macOS the first submenu becomes the app-name menu; add it first so "File" is separate.
@@ -348,7 +354,14 @@ pub fn main() {
             create_file,
             create_dir,
             move_path,
-            delete_path
+            delete_path,
+            sim_start,
+            sim_step,
+            sim_query_active,
+            sim_eval,
+            sim_seek,
+            sim_end,
+            sim_driver_at
         ])
         .run(tauri::generate_context!())
         .expect("error while running Circuit Scope application");

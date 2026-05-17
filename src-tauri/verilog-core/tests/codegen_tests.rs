@@ -502,6 +502,7 @@ endmodule
     let mut project = IrProject {
         modules: vec![],
         diagnostics: vec![],
+        source_map: verilog_core::source_map::SourceMap::new(),
     };
     let mut c = build_ir_for_file("leaf.v", child_src);
     let mut t = build_ir_for_file("top.v", top_src);

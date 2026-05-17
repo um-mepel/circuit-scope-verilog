@@ -1,7 +1,7 @@
 {
   "name": "circuit-scope",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Verilog (IEEE 1364) IDE: edit, simulate to VCD, waveforms — not SystemVerilog.",
   "type": "module",
   "scripts": {
@@ -29,7 +29,8 @@
     "codemirror": "^6.0.2",
     "lucide-react": "^1.7.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "zustand": "^5.0.12"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

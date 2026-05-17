@@ -238,3 +238,23 @@ endmodule
     );
 }
 
+
+#[test]
+fn statement_spans_cover_assignment_byte_range() {
+    use verilog_core::source_map::SourceMap;
+    let src = "module t(input a, output reg y);\n  always @(*) y = a;\nendmodule\n";
+    let mut sm = SourceMap::new();
+    let file_id = sm.intern("t.v", src);
+    let proj = build_ir_for_file("t.v", src);
+    let m = proj.modules.iter().find(|x| x.name == "t").expect("module t");
+    let ab = m.always_blocks.first().expect("at least one always");
+    let (_stmt, span) = ab.stmts.iter_with_spans().next().expect("at least one stmt");
+    assert_eq!(span.file_id, proj.modules[0].file_id);
+    let _ = file_id; // SourceMap precompute check (intern doesn't fail)
+    let text = &src[span.start as usize..span.end as usize];
+    assert!(
+        text.contains("y = a"),
+        "span should cover the assignment, got: {:?}",
+        text
+    );
+}

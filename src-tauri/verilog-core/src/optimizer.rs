@@ -31,7 +31,10 @@ use std::hash::{Hash, Hasher};
 use crate::ir::{
     ir_expr_merge_scalar_into_packed_vec, ir_net_width_in_module, ir_try_eval_const_index_expr,
     IrAssign, IrBinOp, IrCaseArm, IrExpr, IrMemArray, IrModule, IrNet, IrProject, IrStmt, IrUnaryOp,
+    StmtBlock,
 };
+#[cfg(test)]
+use crate::source_map::{SourceMap, SYNTHETIC_FILE};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Public API
@@ -1479,7 +1482,7 @@ fn module_inlining(project: &mut IrProject) -> usize {
                         } else {
                             format!("{}{}", prefix, assign.lhs)
                         };
-                        new_assigns.push(IrAssign { lhs, rhs });
+                        new_assigns.push(IrAssign { lhs, rhs, span: assign.span });
                     }
                     for ma in &child.mem_arrays {
                         new_mem_arrays.push(IrMemArray {
@@ -1844,11 +1847,11 @@ fn try_sink(expr: &IrExpr) -> Option<IrExpr> {
 
 const MAX_UNROLL_ITERATIONS: i64 = 256;
 
-fn unroll_loops(stmts: &mut Vec<IrStmt>) -> usize {
+fn unroll_loops(block: &mut StmtBlock) -> usize {
     let mut count = 0;
     let mut i = 0;
-    while i < stmts.len() {
-        match &mut stmts[i] {
+    while i < block.len() {
+        match &mut block.stmts_mut()[i] {
             IrStmt::IfElse { then_body, else_body, .. } => {
                 count += unroll_loops(then_body);
                 count += unroll_loops(else_body);
@@ -1862,7 +1865,8 @@ fn unroll_loops(stmts: &mut Vec<IrStmt>) -> usize {
                 i += 1;
             }
             IrStmt::For { .. } => {
-                let stmt = stmts[i].clone();
+                let stmt = block.stmts_mut()[i].clone();
+                let outer_span = block.span_of(i);
                 if let IrStmt::For {
                     init_var,
                     init_val,
@@ -1875,10 +1879,14 @@ fn unroll_loops(stmts: &mut Vec<IrStmt>) -> usize {
                     if let Some(unrolled) =
                         try_unroll(&init_var, &init_val, &cond, &step_var, &step_expr, &body)
                     {
-                        stmts.splice(i..=i, unrolled);
+                        // Splice unrolled statements into the parallel stmt + span vecs.
+                        // Each unrolled copy inherits the outer For's span so the debugger
+                        // highlights the original source on each iteration.
+                        let n = unrolled.len();
+                        block.stmts_mut().splice(i..=i, unrolled);
+                        let span_vec = block.spans_mut();
+                        span_vec.splice(i..=i, std::iter::repeat(outer_span).take(n));
                         count += 1;
-                        // Don't increment i — we replaced the For with
-                        // expanded statements that need to be re-scanned
                         continue;
                     }
                 }
@@ -1898,7 +1906,7 @@ fn try_unroll(
     cond: &IrExpr,
     step_var: &str,
     step_expr: &IrExpr,
-    body: &[IrStmt],
+    body: &StmtBlock,
 ) -> Option<Vec<IrStmt>> {
     if init_var != step_var {
         return None;
@@ -1983,6 +1991,14 @@ fn try_unroll(
     Some(result)
 }
 
+fn substitute_loop_var_in_block(block: &StmtBlock, var: &str, val: i64) -> StmtBlock {
+    let mut out = StmtBlock::with_capacity(block.len());
+    for (s, sp) in block.iter_with_spans() {
+        out.push(substitute_loop_var_in_stmt(s, var, val), sp);
+    }
+    out
+}
+
 fn substitute_loop_var_in_stmt(stmt: &IrStmt, var: &str, val: i64) -> IrStmt {
     match stmt {
         IrStmt::BlockingAssign { lhs, rhs } => IrStmt::BlockingAssign {
@@ -2006,14 +2022,8 @@ fn substitute_loop_var_in_stmt(stmt: &IrStmt, var: &str, val: i64) -> IrStmt {
         },
         IrStmt::IfElse { cond, then_body, else_body } => IrStmt::IfElse {
             cond: substitute_loop_var(cond, var, val),
-            then_body: then_body
-                .iter()
-                .map(|s| substitute_loop_var_in_stmt(s, var, val))
-                .collect(),
-            else_body: else_body
-                .iter()
-                .map(|s| substitute_loop_var_in_stmt(s, var, val))
-                .collect(),
+            then_body: substitute_loop_var_in_block(then_body, var, val),
+            else_body: substitute_loop_var_in_block(else_body, var, val),
         },
         IrStmt::Case { expr, arms, default } => IrStmt::Case {
             expr: substitute_loop_var(expr, var, val),
@@ -2021,17 +2031,11 @@ fn substitute_loop_var_in_stmt(stmt: &IrStmt, var: &str, val: i64) -> IrStmt {
                 .iter()
                 .map(|a| IrCaseArm {
                     value: substitute_loop_var(&a.value, var, val),
-                    body: a
-                        .body
-                        .iter()
-                        .map(|s| substitute_loop_var_in_stmt(s, var, val))
-                        .collect(),
+                    body: substitute_loop_var_in_block(&a.body, var, val),
+                    care_mask: a.care_mask,
                 })
                 .collect(),
-            default: default
-                .iter()
-                .map(|s| substitute_loop_var_in_stmt(s, var, val))
-                .collect(),
+            default: substitute_loop_var_in_block(default, var, val),
         },
         IrStmt::For { .. } => stmt.clone(),
         IrStmt::Delay(_) | IrStmt::SystemTask { .. } => stmt.clone(),
@@ -2080,6 +2084,7 @@ fn substitute_loop_var(expr: &IrExpr, var: &str, val: i64) -> IrExpr {
 mod tests {
     use super::*;
     use crate::ir::{IrBinOp, IrExpr, IrNet, IrUnaryOp};
+    use crate::source_map::Span;
     use crate::Port;
 
     fn make_module(assigns: Vec<IrAssign>, ports: Vec<Port>) -> IrModule {
@@ -2094,6 +2099,7 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         }
     }
 
@@ -2117,7 +2123,7 @@ mod tests {
     #[test]
     fn fold_add_constants() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, c(3), c(5)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, c(3), c(5)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2127,7 +2133,7 @@ mod tests {
     #[test]
     fn fold_nested_constants() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, bin(IrBinOp::Add, c(2), c(3)), c(4)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, bin(IrBinOp::Add, c(2), c(3)), c(4)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2137,7 +2143,7 @@ mod tests {
     #[test]
     fn fold_unary_not() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Not, c(0)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Not, c(0)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2147,7 +2153,7 @@ mod tests {
     #[test]
     fn fold_double_not() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Not, unary(IrUnaryOp::Not, id("a"))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Not, unary(IrUnaryOp::Not, id("a"))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2157,7 +2163,7 @@ mod tests {
     #[test]
     fn fold_double_neg() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Neg, unary(IrUnaryOp::Neg, id("a"))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Neg, unary(IrUnaryOp::Neg, id("a"))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2169,7 +2175,7 @@ mod tests {
     #[test]
     fn identity_add_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("a"), c(0)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("a"), c(0)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2179,7 +2185,7 @@ mod tests {
     #[test]
     fn identity_mul_one() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("a"), c(1)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("a"), c(1)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2189,7 +2195,7 @@ mod tests {
     #[test]
     fn annihilator_and_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), c(0)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), c(0)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2199,7 +2205,7 @@ mod tests {
     #[test]
     fn annihilator_mul_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("a"), c(0)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("a"), c(0)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2209,7 +2215,7 @@ mod tests {
     #[test]
     fn identity_or_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, c(0), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, c(0), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2219,7 +2225,7 @@ mod tests {
     #[test]
     fn xor_self_is_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Xor, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Xor, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2229,7 +2235,7 @@ mod tests {
     #[test]
     fn sub_self_is_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Sub, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Sub, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2239,7 +2245,7 @@ mod tests {
     #[test]
     fn and_self_is_self() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2249,7 +2255,7 @@ mod tests {
     #[test]
     fn or_self_is_self() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2259,7 +2265,7 @@ mod tests {
     #[test]
     fn div_self_is_one() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Div, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Div, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2269,7 +2275,7 @@ mod tests {
     #[test]
     fn mod_self_is_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mod, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mod, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2281,7 +2287,7 @@ mod tests {
     #[test]
     fn eq_self_is_one() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Eq, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Eq, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2291,7 +2297,7 @@ mod tests {
     #[test]
     fn ne_self_is_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Ne, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Ne, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2301,7 +2307,7 @@ mod tests {
     #[test]
     fn lt_self_is_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Lt, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Lt, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2313,7 +2319,7 @@ mod tests {
     #[test]
     fn and_complement_is_zero() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), unary(IrUnaryOp::Not, id("a"))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), unary(IrUnaryOp::Not, id("a"))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2323,7 +2329,7 @@ mod tests {
     #[test]
     fn or_complement_is_all_ones() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("a"), unary(IrUnaryOp::Not, id("a"))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("a"), unary(IrUnaryOp::Not, id("a"))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2337,7 +2343,7 @@ mod tests {
         // ~(3 & 5) should fold to ~(1) = ~1 = -2 via const fold
         // But De Morgan pushes in first: (~3 | ~5) → (-4 | -6) → (-4 | -6) = -2
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Not, bin(IrBinOp::And, c(3), c(5))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: unary(IrUnaryOp::Not, bin(IrBinOp::And, c(3), c(5))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2350,7 +2356,7 @@ mod tests {
     fn absorption_and_or() {
         // a & (a | b) → a
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), bin(IrBinOp::Or, id("a"), id("b"))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("a"), bin(IrBinOp::Or, id("a"), id("b"))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2361,7 +2367,7 @@ mod tests {
     fn absorption_or_and() {
         // a | (a & b) → a
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("a"), bin(IrBinOp::And, id("a"), id("b"))) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("a"), bin(IrBinOp::And, id("a"), id("b"))), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2373,7 +2379,7 @@ mod tests {
     #[test]
     fn strength_mul_power_of_2() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("a"), c(8)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("a"), c(8)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2383,7 +2389,7 @@ mod tests {
     #[test]
     fn strength_div_power_of_2() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Div, id("a"), c(4)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Div, id("a"), c(4)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2393,7 +2399,7 @@ mod tests {
     #[test]
     fn strength_mod_power_of_2() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mod, id("a"), c(16)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mod, id("a"), c(16)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2406,8 +2412,8 @@ mod tests {
     fn const_prop_simple() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "tmp".into(), rhs: c(42) },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("tmp"), c(1)) },
+                IrAssign { lhs: "tmp".into(), rhs: c(42), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("tmp"), c(1)), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2423,8 +2429,8 @@ mod tests {
         // t = a + 1, y = t + 2  →  y = a + 1 + 2  →  y = a + 3 (after fold)
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "t".into(), rhs: bin(IrBinOp::Add, id("a"), c(1)) },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("t"), c(2)) },
+                IrAssign { lhs: "t".into(), rhs: bin(IrBinOp::Add, id("a"), c(1)), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("t"), c(2)), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2438,8 +2444,8 @@ mod tests {
     fn alias_simple() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "b".into(), rhs: id("a") },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("b"), c(1)) },
+                IrAssign { lhs: "b".into(), rhs: id("a"), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("b"), c(1)), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2452,9 +2458,9 @@ mod tests {
     fn alias_chain() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "c_wire".into(), rhs: id("b_wire") },
-                IrAssign { lhs: "b_wire".into(), rhs: id("a") },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("c_wire"), c(1)) },
+                IrAssign { lhs: "c_wire".into(), rhs: id("b_wire"), span: Span::dummy() },
+                IrAssign { lhs: "b_wire".into(), rhs: id("a"), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("c_wire"), c(1)), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2471,9 +2477,9 @@ mod tests {
         // After CSE: t2 rewritten to use t1 → y = t1 & t1 → y = t1
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "t1".into(), rhs: bin(IrBinOp::Add, id("a"), id("b")) },
-                IrAssign { lhs: "t2".into(), rhs: bin(IrBinOp::Add, id("a"), id("b")) },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("t1"), id("t2")) },
+                IrAssign { lhs: "t1".into(), rhs: bin(IrBinOp::Add, id("a"), id("b")), span: Span::dummy() },
+                IrAssign { lhs: "t2".into(), rhs: bin(IrBinOp::Add, id("a"), id("b")), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::And, id("t1"), id("t2")), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2489,8 +2495,8 @@ mod tests {
     fn dead_signal_removed() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "dead".into(), rhs: c(99) },
-                IrAssign { lhs: "y".into(), rhs: id("a") },
+                IrAssign { lhs: "dead".into(), rhs: c(99), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: id("a"), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2502,7 +2508,7 @@ mod tests {
     #[test]
     fn port_signal_not_removed() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: c(5) }],
+            vec![IrAssign { lhs: "y".into(), rhs: c(5), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2520,8 +2526,7 @@ mod tests {
                     cond: Box::new(c(1)),
                     then_expr: Box::new(id("a")),
                     else_expr: Box::new(id("b")),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2537,8 +2542,7 @@ mod tests {
                     cond: Box::new(c(0)),
                     then_expr: Box::new(id("a")),
                     else_expr: Box::new(id("b")),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2554,8 +2558,7 @@ mod tests {
                     cond: Box::new(id("sel")),
                     then_expr: Box::new(id("a")),
                     else_expr: Box::new(id("a")),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2568,8 +2571,8 @@ mod tests {
     fn combined_optimization() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "tmp".into(), rhs: c(2) },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("tmp"), c(4)) },
+                IrAssign { lhs: "tmp".into(), rhs: c(2), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Mul, id("tmp"), c(4)), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2581,7 +2584,7 @@ mod tests {
     #[test]
     fn shl_zero_identity() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Shl, id("a"), c(0)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Shl, id("a"), c(0)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2591,7 +2594,7 @@ mod tests {
     #[test]
     fn fold_eq_true() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Eq, c(7), c(7)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Eq, c(7), c(7)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2601,7 +2604,7 @@ mod tests {
     #[test]
     fn fold_lt_false() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Lt, c(10), c(3)) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Lt, c(10), c(3)), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2613,7 +2616,7 @@ mod tests {
     #[test]
     fn logand_zero_short_circuits() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::LogAnd, c(0), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::LogAnd, c(0), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2623,7 +2626,7 @@ mod tests {
     #[test]
     fn logor_nonzero_short_circuits() {
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::LogOr, c(5), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::LogOr, c(5), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2637,9 +2640,9 @@ mod tests {
         // t1 = a & b,  t2 = b & a  → after canonical both are a & b → CSE
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "t1".into(), rhs: bin(IrBinOp::And, id("a"), id("b")) },
-                IrAssign { lhs: "t2".into(), rhs: bin(IrBinOp::And, id("b"), id("a")) },
-                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("t1"), id("t2")) },
+                IrAssign { lhs: "t1".into(), rhs: bin(IrBinOp::And, id("a"), id("b")), span: Span::dummy() },
+                IrAssign { lhs: "t2".into(), rhs: bin(IrBinOp::And, id("b"), id("a")), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Or, id("t1"), id("t2")), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -2655,7 +2658,7 @@ mod tests {
     fn peephole_add_self_to_shl1() {
         // a + a → a << 1
         let mut m = make_module(
-            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("a"), id("a")) }],
+            vec![IrAssign { lhs: "y".into(), rhs: bin(IrBinOp::Add, id("a"), id("a")), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2672,8 +2675,7 @@ mod tests {
                     IrBinOp::Add,
                     IrExpr::Unary { op: IrUnaryOp::Neg, operand: Box::new(id("a")) },
                     id("b"),
-                ),
-            }],
+                ), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2690,8 +2692,7 @@ mod tests {
                     IrBinOp::Add,
                     id("a"),
                     IrExpr::Unary { op: IrUnaryOp::Neg, operand: Box::new(id("b")) },
-                ),
-            }],
+                ), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2708,8 +2709,7 @@ mod tests {
                     IrBinOp::Sub,
                     id("a"),
                     IrExpr::Unary { op: IrUnaryOp::Neg, operand: Box::new(id("b")) },
-                ),
-            }],
+                ), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2726,8 +2726,7 @@ mod tests {
                     IrBinOp::Shr,
                     bin(IrBinOp::Shl, id("a"), c(3)),
                     c(3),
-                ),
-            }],
+                ), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2749,8 +2748,7 @@ mod tests {
                         else_expr: Box::new(c(5)),
                     },
                     c(2),
-                ),
-            }],
+                ), span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2782,8 +2780,7 @@ mod tests {
                         else_expr: Box::new(id("b")),
                     }),
                     else_expr: Box::new(id("e")),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2811,8 +2808,7 @@ mod tests {
                         then_expr: Box::new(id("b")),
                         else_expr: Box::new(id("e")),
                     }),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2838,8 +2834,7 @@ mod tests {
                     cond: Box::new(id("sel")),
                     then_expr: Box::new(bin(IrBinOp::Add, id("a"), id("x"))),
                     else_expr: Box::new(bin(IrBinOp::Add, id("b"), id("x"))),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2867,8 +2862,7 @@ mod tests {
                     cond: Box::new(id("sel")),
                     then_expr: Box::new(bin(IrBinOp::And, id("x"), id("a"))),
                     else_expr: Box::new(bin(IrBinOp::And, id("x"), id("b"))),
-                },
-            }],
+                }, span: Span::dummy() }],
             vec![port("y")],
         );
         optimize_module(&mut m);
@@ -2898,14 +2892,15 @@ mod tests {
             ports: vec![port("a"), port("y")],
             nets: vec![IrNet { name: "t".into(), width: 1 }],
             assigns: vec![
-                IrAssign { lhs: "t".into(), rhs: IrExpr::Unary { op: IrUnaryOp::Not, operand: Box::new(id("a")) } },
-                IrAssign { lhs: "y".into(), rhs: id("t") },
+                IrAssign { lhs: "t".into(), rhs: IrExpr::Unary { op: IrUnaryOp::Not, operand: Box::new(id("a")) }, span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: id("t"), span: Span::dummy() },
             ],
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let parent = IrModule {
             name: "top".into(),
@@ -2921,10 +2916,12 @@ mod tests {
                     IrPortConn {
                         port_name: Some("a".into()),
                         expr: id("x"),
+                        span: Span::dummy(),
                     },
                     IrPortConn {
                         port_name: Some("y".into()),
                         expr: id("z"),
+                        span: Span::dummy(),
                     },
                 ],
             }],
@@ -2932,10 +2929,12 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
             diagnostics: vec![],
+            source_map: SourceMap::new(),
         };
         let metrics = optimize_project(&mut proj);
         assert_eq!(metrics.modules_inlined, 1);
@@ -2969,13 +2968,13 @@ mod tests {
             nets: vec![],
             assigns: vec![IrAssign {
                 lhs: "cout".into(),
-                rhs: id("a"),
-            }],
+                rhs: id("a"), span: Span::dummy() }],
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let parent = IrModule {
             name: "Top".into(),
@@ -2994,6 +2993,7 @@ mod tests {
                     IrPortConn {
                         port_name: Some("a".into()),
                         expr: IrExpr::Const(1),
+                        span: Span::dummy(),
                     },
                     IrPortConn {
                         port_name: Some("cout".into()),
@@ -3002,6 +3002,7 @@ mod tests {
                             msb: Box::new(bin(IrBinOp::Add, c(0), c(1))),
                             lsb: Box::new(bin(IrBinOp::Add, c(0), c(1))),
                         },
+                        span: Span::dummy(),
                     },
                 ],
             }],
@@ -3009,10 +3010,12 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
             diagnostics: vec![],
+            source_map: SourceMap::new(),
         };
         let _ = optimize_project(&mut proj);
         let top = proj.modules.iter().find(|m| m.name == "Top").unwrap();
@@ -3034,7 +3037,7 @@ mod tests {
         use crate::ir::{IrInstance, IrProject};
 
         let big_assigns: Vec<IrAssign> = (0..20)
-            .map(|i| IrAssign { lhs: format!("w{}", i), rhs: c(i) })
+            .map(|i| IrAssign { lhs: format!("w{}", i), rhs: c(i), span: Span::dummy() })
             .collect();
         let child = IrModule {
             name: "big".into(),
@@ -3047,6 +3050,7 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let parent = IrModule {
             name: "top".into(),
@@ -3064,10 +3068,12 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
             diagnostics: vec![],
+            source_map: SourceMap::new(),
         };
         let metrics = optimize_project(&mut proj);
         assert_eq!(metrics.modules_inlined, 0);
@@ -3084,7 +3090,7 @@ mod tests {
             path: "test.v".into(),
             ports: vec![],
             nets: vec![],
-            assigns: vec![IrAssign { lhs: "w".into(), rhs: c(1) }],
+            assigns: vec![IrAssign { lhs: "w".into(), rhs: c(1), span: Span::dummy() }],
             instances: vec![IrInstance {
                 module_name: "deep".into(),
                 parameter_assignments: vec![],
@@ -3095,6 +3101,7 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let parent = IrModule {
             name: "top".into(),
@@ -3112,10 +3119,12 @@ mod tests {
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
             diagnostics: vec![],
+            source_map: SourceMap::new(),
         };
         let metrics = optimize_project(&mut proj);
         assert_eq!(metrics.modules_inlined, 0);
@@ -3132,18 +3141,18 @@ mod tests {
             nets: vec![IrNet { name: "t".into(), width: 1 }],
             assigns: vec![IrAssign {
                 lhs: "y".into(),
-                rhs: id("t"),
-            }],
+                rhs: id("t"), span: Span::dummy() }],
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![IrInitial {
-                stmts: vec![IrStmt::BlockingAssign {
+                stmts: StmtBlock::from(vec![IrStmt::BlockingAssign {
                     lhs: "t".into(),
                     rhs: c(1),
-                }],
+                }]),
             }],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let parent = IrModule {
             name: "top".into(),
@@ -3158,16 +3167,19 @@ mod tests {
                 connections: vec![IrPortConn {
                     port_name: Some("y".into()),
                     expr: id("z"),
+                    span: Span::dummy(),
                 }],
             }],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
             diagnostics: vec![],
+            source_map: SourceMap::new(),
         };
         let metrics = optimize_project(&mut proj);
         assert_eq!(metrics.modules_inlined, 0, "must not inline away initial_blocks");
@@ -3181,17 +3193,18 @@ mod tests {
     fn loop_unrolling_simple_for() {
         // for (i = 0; i < 3; i = i + 1) out = i;
         // → out = 0; out = 1; out = 2;
-        let mut stmts = vec![IrStmt::For {
+        let mut stmts: StmtBlock = vec![IrStmt::For {
             init_var: "i".into(),
             init_val: c(0),
             cond: bin(IrBinOp::Lt, id("i"), c(3)),
             step_var: "i".into(),
             step_expr: bin(IrBinOp::Add, id("i"), c(1)),
-            body: vec![IrStmt::BlockingAssign {
+            body: StmtBlock::from(vec![IrStmt::BlockingAssign {
                 lhs: "out".into(),
                 rhs: id("i"),
-            }],
-        }];
+            }]),
+        }]
+        .into();
         let count = unroll_loops(&mut stmts);
         assert_eq!(count, 1);
         assert_eq!(stmts.len(), 3);
@@ -3206,17 +3219,18 @@ mod tests {
 
     #[test]
     fn loop_unrolling_skips_unknown_bounds() {
-        let mut stmts = vec![IrStmt::For {
+        let mut stmts: StmtBlock = vec![IrStmt::For {
             init_var: "i".into(),
             init_val: c(0),
             cond: bin(IrBinOp::Lt, id("i"), id("n")), // n is not a constant
             step_var: "i".into(),
             step_expr: bin(IrBinOp::Add, id("i"), c(1)),
-            body: vec![IrStmt::BlockingAssign {
+            body: StmtBlock::from(vec![IrStmt::BlockingAssign {
                 lhs: "out".into(),
                 rhs: id("i"),
-            }],
-        }];
+            }]),
+        }]
+        .into();
         let count = unroll_loops(&mut stmts);
         assert_eq!(count, 0);
         assert_eq!(stmts.len(), 1); // For loop remains
@@ -3228,8 +3242,8 @@ mod tests {
     fn score_history_tracks_size() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "t".into(), rhs: bin(IrBinOp::Add, c(1), c(2)) },
-                IrAssign { lhs: "y".into(), rhs: id("t") },
+                IrAssign { lhs: "t".into(), rhs: bin(IrBinOp::Add, c(1), c(2)), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: id("t"), span: Span::dummy() },
             ],
             vec![port("y")],
         );
@@ -3247,8 +3261,8 @@ mod tests {
     fn metrics_tracks_pass_counts() {
         let mut m = make_module(
             vec![
-                IrAssign { lhs: "t".into(), rhs: bin(IrBinOp::Add, c(1), c(2)) },
-                IrAssign { lhs: "y".into(), rhs: id("t") },
+                IrAssign { lhs: "t".into(), rhs: bin(IrBinOp::Add, c(1), c(2)), span: Span::dummy() },
+                IrAssign { lhs: "y".into(), rhs: id("t"), span: Span::dummy() },
             ],
             vec![port("y")],
         );

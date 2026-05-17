@@ -32,7 +32,17 @@ pub fn parse_verilog_number(s: &str) -> i64 {
         } else {
             (10, after)
         };
-        let clean: String = digits.chars().filter(|c| *c != '_').collect();
+        // For `casez`/`casex` patterns we accept `?` / `x` / `z` as wildcards
+        // in the literal. The numeric value treats those positions as 0; the
+        // case-arm matcher reconstructs the care-mask separately.
+        let clean: String = digits
+            .chars()
+            .filter(|c| *c != '_')
+            .map(|c| match c {
+                '?' | 'x' | 'X' | 'z' | 'Z' => '0',
+                other => other,
+            })
+            .collect();
         i64::from_str_radix(&clean, radix).unwrap_or(0)
     } else {
         let clean: String = s.chars().filter(|c| *c != '_').collect();

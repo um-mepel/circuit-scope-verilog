@@ -97,12 +97,25 @@ fn build_semantic_module(cst: CstModule) -> SemanticModule {
                 nets.extend(names);
             }
             CstModuleItem::Assign { target, .. } => {
-                let lhs = match target {
-                    AssignTarget::Whole(s) => s,
-                    AssignTarget::BitSelect { reg, .. } => reg,
-                    AssignTarget::PartSelect { reg, .. } => reg,
-                };
-                assigns.push(AssignRef { lhs });
+                // Concat-LHS records each leaf identifier separately so the
+                // semantic graph still knows about every signal being driven.
+                fn collect_lhs(t: AssignTarget, out: &mut Vec<String>) {
+                    match t {
+                        AssignTarget::Whole(s) => out.push(s),
+                        AssignTarget::BitSelect { reg, .. } => out.push(reg),
+                        AssignTarget::PartSelect { reg, .. } => out.push(reg),
+                        AssignTarget::Concat(parts) => {
+                            for p in parts {
+                                collect_lhs(p, out);
+                            }
+                        }
+                    }
+                }
+                let mut lhs_names = Vec::new();
+                collect_lhs(target, &mut lhs_names);
+                for lhs in lhs_names {
+                    assigns.push(AssignRef { lhs });
+                }
             }
             CstModuleItem::Instance {
                 module_name,
@@ -133,6 +146,38 @@ fn build_semantic_module(cst: CstModule) -> SemanticModule {
             CstModuleItem::Always { .. } => {}
             CstModuleItem::Initial { .. } => {}
             CstModuleItem::LocalParam { .. } => {}
+            CstModuleItem::GenerateForBody { .. }
+            | CstModuleItem::GenerateIf { .. }
+            | CstModuleItem::GenerateCase { .. } => {
+                // Semantic walker doesn't yet recurse into these for assign
+                // collection; the IR elaborator handles them and the result
+                // is reflected in the module's `assigns` IR list. Tests
+                // don't depend on semantic.rs reporting them.
+            }
+            CstModuleItem::GenerateForAssigns { assigns: body_assigns, .. } => {
+                // Record each LHS leaf identifier so the semantic graph
+                // reflects every signal driven by the unrolled assigns.
+                fn collect(t: &crate::parser::AssignTarget, out: &mut Vec<String>) {
+                    use crate::parser::AssignTarget;
+                    match t {
+                        AssignTarget::Whole(s) => out.push(s.clone()),
+                        AssignTarget::BitSelect { reg, .. } => out.push(reg.clone()),
+                        AssignTarget::PartSelect { reg, .. } => out.push(reg.clone()),
+                        AssignTarget::Concat(parts) => {
+                            for p in parts {
+                                collect(p, out);
+                            }
+                        }
+                    }
+                }
+                for (target, _expr, _range) in body_assigns {
+                    let mut names = Vec::new();
+                    collect(&target, &mut names);
+                    for lhs in names {
+                        assigns.push(AssignRef { lhs });
+                    }
+                }
+            }
         }
     }
 

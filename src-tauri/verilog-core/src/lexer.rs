@@ -39,6 +39,12 @@ pub enum TokenKind {
     Endgenerate,
     /// `genvar` (loop index in generate; statement skipped at CST level).
     Genvar,
+    Function,
+    Endfunction,
+    Task,
+    Endtask,
+    Casez,
+    Casex,
     // non-blocking assign
     NonBlockAssign, // <=  (contextually distinct from Le)
     // punctuation / single-char
@@ -92,6 +98,15 @@ pub struct Token {
     pub kind: TokenKind,
     pub lexeme: String,
     pub offset: usize,
+    /// Exclusive end byte offset: `offset + lexeme.len()` for normal tokens; equals `offset` for EOF.
+    pub end: usize,
+}
+
+impl Token {
+    #[inline]
+    pub fn span_range(&self) -> (u32, u32) {
+        (self.offset as u32, self.end as u32)
+    }
 }
 
 /// Lex the contents of a [`SourceFile`] into a flat list of tokens.
@@ -201,17 +216,27 @@ impl<'a> Lexer<'a> {
                     "generate" => TokenKind::Generate,
                     "endgenerate" => TokenKind::Endgenerate,
                     "genvar" => TokenKind::Genvar,
+                    "function" => TokenKind::Function,
+                    "endfunction" => TokenKind::Endfunction,
+                    "task" => TokenKind::Task,
+                    "endtask" => TokenKind::Endtask,
+                    "casez" => TokenKind::Casez,
+                    "casex" => TokenKind::Casex,
                     _ => TokenKind::Identifier,
                 };
                 tokens.push(Token {
                     kind,
                     lexeme: text.to_string(),
                     offset: start,
+                    end: self.offset,
                 });
             } else if ch.is_ascii_digit() {
                 self.bump();
+                // Sized literals like `8'b1???_????` include `?` in the body
+                // (case-pattern wildcard). `x`/`z` are already accepted by
+                // is_ascii_alphanumeric.
                 while let Some(c) = self.next_char() {
-                    if c.is_ascii_alphanumeric() || c == '\'' || c == '_' {
+                    if c.is_ascii_alphanumeric() || c == '\'' || c == '_' || c == '?' {
                         self.bump();
                     } else {
                         break;
@@ -221,6 +246,7 @@ impl<'a> Lexer<'a> {
                     kind: TokenKind::Number,
                     lexeme: self.src[start..self.offset].to_string(),
                     offset: start,
+                    end: self.offset,
                 });
             } else if ch == '\'' {
                 // Unsized literals: 'd0, 'b1010, 'hFF (sizes like 8'd0 are one token from digit path)
@@ -232,6 +258,7 @@ impl<'a> Lexer<'a> {
                             kind: TokenKind::Other,
                             lexeme: "'".to_string(),
                             offset: start,
+                            end: self.offset,
                         });
                         continue;
                     }
@@ -283,6 +310,7 @@ impl<'a> Lexer<'a> {
                     kind: TokenKind::Number,
                     lexeme: self.src[start..self.offset].to_string(),
                     offset: start,
+                    end: self.offset,
                 });
             } else {
                 self.bump();
@@ -372,13 +400,16 @@ impl<'a> Lexer<'a> {
                     kind,
                     lexeme: self.src[start..self.offset].to_string(),
                     offset: start,
+                    end: self.offset,
                 });
             }
         }
+        let eof_at = self.src.len();
         tokens.push(Token {
             kind: TokenKind::Eof,
             lexeme: String::new(),
-            offset: self.src.len(),
+            offset: eof_at,
+            end: eof_at,
         });
         tokens
     }

@@ -24,6 +24,7 @@ import {
 import { theme } from "../ui/theme";
 import { IconButton } from "./IconButton";
 import type { ToastKind } from "./ToastStack";
+import { useDebuggerStore } from "../state/debuggerStore";
 
 /**
  * Strictly increasing id for each `vcd_open`, safe for Rust `u64` over Tauri IPC.
@@ -106,6 +107,8 @@ const COL_RULER_TEXT = wf.rulerText;
 const COL_ROW_STROKE = wf.rowStroke;
 const COL_SAMPLE_LINE = wf.sampleLine;
 const COL_SAMPLE_TAG = wf.sampleTag;
+/** Dashed hover cursor drawn on top of the pinned cursor. */
+const COL_HOVER_LINE = "rgba(148, 163, 184, 0.75)";
 
 /** Rounds span/target into 1–2–5×10ⁿ tick spacing (scales with zoom). */
 function niceStepForSpan(span: number, targetDivisions: number): number {
@@ -319,20 +322,63 @@ function queryTimeWindow(
   return { tStart, tEnd };
 }
 
-function walkVars(meta: VcdOpenResponse): Map<number, { name: string; bits: number }> {
-  const m = new Map<number, { name: string; bits: number }>();
-  const walk = (n: VcdScopeNode) => {
+function walkVars(
+  meta: VcdOpenResponse,
+): Map<number, { name: string; bits: number; path: string }> {
+  const m = new Map<number, { name: string; bits: number; path: string }>();
+  const walk = (n: VcdScopeNode, prefix: string) => {
+    const here = prefix.length > 0 ? `${prefix}.${n.name}` : n.name;
     for (const v of n.vars) {
-      m.set(v.signalId, { name: v.name, bits: v.bits });
+      m.set(v.signalId, {
+        name: v.name,
+        bits: v.bits,
+        path: here.length > 0 ? `${here}.${v.name}` : v.name,
+      });
     }
-    for (const s of n.scopes) walk(s);
+    for (const s of n.scopes) walk(s, here);
   };
-  for (const root of meta.hierarchy) walk(root);
+  for (const root of meta.hierarchy) walk(root, "");
   return m;
 }
 
 /** `signalId` = whole bus; `signalId:bN` = bit N (LSB = 0). */
 type TraceKey = string;
+
+type PersistedWaveformUiState = {
+  selected: TraceKey[];
+  focusTraceKey: TraceKey | null;
+  expandedBusKeys: string[];
+  collapsedScopePaths: string[];
+};
+
+const waveformUiStateByPath = new Map<string, PersistedWaveformUiState>();
+
+function uiStateStorageKey(vcdPath: string): string {
+  return `circuitscope_waveform_ui_${vcdPath}`;
+}
+
+function loadPersistedUiState(vcdPath: string): PersistedWaveformUiState | null {
+  const mem = waveformUiStateByPath.get(vcdPath);
+  if (mem) return mem;
+  try {
+    const raw = window.localStorage.getItem(uiStateStorageKey(vcdPath));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedWaveformUiState;
+    if (!parsed || !Array.isArray(parsed.selected)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function savePersistedUiState(vcdPath: string, state: PersistedWaveformUiState): void {
+  waveformUiStateByPath.set(vcdPath, state);
+  try {
+    window.localStorage.setItem(uiStateStorageKey(vcdPath), JSON.stringify(state));
+  } catch {
+    // ignore quota/storage issues
+  }
+}
 
 function traceKeyWhole(signalId: number): TraceKey {
   return String(signalId);
@@ -403,7 +449,7 @@ function projectTransitionsToBit(
 function transitionsForTraceKey(
   traceKey: TraceKey,
   bySig: Map<number, VcdTransition[]>,
-  signalInfo: Map<number, { name: string; bits: number }>,
+  signalInfo: Map<number, { name: string; bits: number; path: string }>,
 ): VcdTransition[] {
   const { signalId, bit } = parseTraceKey(traceKey);
   const raw = bySig.get(signalId) ?? [];
@@ -414,13 +460,28 @@ function transitionsForTraceKey(
 
 function traceDisplayName(
   traceKey: TraceKey,
-  signalInfo: Map<number, { name: string; bits: number }>,
+  signalInfo: Map<number, { name: string; bits: number; path: string }>,
 ): string {
   const { signalId, bit } = parseTraceKey(traceKey);
   const info = signalInfo.get(signalId);
   const base = info?.name ?? `#${signalId}`;
   if (bit == null) return base;
   return `${base}[${bit}]`;
+}
+
+function availableTraceKeys(meta: VcdOpenResponse): Set<TraceKey> {
+  const out = new Set<TraceKey>();
+  const walk = (n: VcdScopeNode) => {
+    for (const v of n.vars) {
+      out.add(traceKeyWhole(v.signalId));
+      if (v.bits > 1) {
+        for (let bi = 0; bi < v.bits; bi++) out.add(traceKeyBit(v.signalId, bi));
+      }
+    }
+    for (const s of n.scopes) walk(s);
+  };
+  for (const root of meta.hierarchy) walk(root);
+  return out;
 }
 
 /** Sidebar: hierarchy + visibility checkboxes; nested scopes can collapse; buses decompose per-bit. */
@@ -447,7 +508,7 @@ function ScopeTree({
   selected: Set<TraceKey>;
   focusTraceKey: TraceKey | null;
   toggle: (key: TraceKey) => void;
-  signalInfo: Map<number, { name: string; bits: number }>;
+  signalInfo: Map<number, { name: string; bits: number; path: string }>;
 }) {
   const nested = depth > 0;
   const hasBody = node.vars.length > 0 || node.scopes.length > 0;
@@ -805,7 +866,47 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     lastX: 0,
   });
 
-  const [cursorTime, setCursorTime] = useState<number | null>(null);
+  /**
+   * Local hover-time in VCD tick units. Drawn as a dashed "ghost" cursor.
+   * Cleared on mouse leave.
+   */
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
+  /**
+   * Local fallback pin (tick units) used when no debugger session is active or
+   * the VCD has no parseable timescale. When a debug session is live, the
+   * pinned cursor is owned by `useDebuggerStore` instead (femtoseconds).
+   */
+  const [localPinnedTime, setLocalPinnedTime] = useState<number | null>(null);
+  const pinnedTimeFs = useDebuggerStore((s) => s.pinnedTimeFs);
+  const debuggerSessionId = useDebuggerStore((s) => s.sessionId);
+  const seekDebugger = useDebuggerStore((s) => s.seek);
+
+  /** VCD seconds-per-tick, memoized to avoid redundant parsing. */
+  const secPerTick = useMemo(() => vcdSecondsPerTick(meta), [meta]);
+
+  /** Convert store femtosecond time → VCD tick time for drawing. */
+  const pinnedTimeTicks = useMemo(() => {
+    if (pinnedTimeFs == null || secPerTick == null || !(secPerTick > 0)) return null;
+    return pinnedTimeFs / 1e15 / secPerTick;
+  }, [pinnedTimeFs, secPerTick]);
+
+  /** Unified "pinned" (sticky) cursor in tick units. Prefers the backend-owned pin. */
+  const pinnedTime = pinnedTimeTicks ?? localPinnedTime;
+
+  /** What the values column shows: hover if hovering, else pinned. */
+  const cursorTime = hoverTime ?? pinnedTime;
+
+  /** Pin time at `t` (tick units): sync with the debugger backend if we can, else locally. */
+  const pinAt = useCallback(
+    (tTicks: number) => {
+      if (debuggerSessionId != null && secPerTick != null && secPerTick > 0) {
+        const fs = Math.round(tTicks * secPerTick * 1e15);
+        void seekDebugger(fs);
+      }
+      setLocalPinnedTime(tTicks);
+    },
+    [debuggerSessionId, secPerTick, seekDebugger],
+  );
 
   const viewMetaRef = useRef({ tView0, tView1, meta, selectedArr: [] as TraceKey[] });
   const navRef = useRef({ tView0, tView1, cursorTime, meta: null as VcdOpenResponse | null });
@@ -850,7 +951,13 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
           for (const s of n.scopes) walk(s);
         };
         for (const root of res.hierarchy) walk(root);
-        const selectedKeys = first.map(traceKeyWhole).sort(compareTraceKey);
+        const persisted = loadPersistedUiState(vcdPath);
+        const available = availableTraceKeys(res);
+        const defaultSelected = first.map(traceKeyWhole).sort(compareTraceKey);
+        const selectedKeys =
+          persisted && persisted.selected.length > 0
+            ? persisted.selected.filter((k) => available.has(k)).sort(compareTraceKey)
+            : defaultSelected;
         const qIds = [...first].sort((a, b) => a - b);
         // Refs must match the new file before the first `fireQuery`; otherwise a pending rAF can
         // still read the previous file's time window (see stale reqT1 vs ttMax in debug logs).
@@ -871,12 +978,20 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
           selectedArr: selectedKeys,
         };
         setMeta(res);
-        setCollapsedScopePaths(new Set());
-        setExpandedBusKeys(new Set());
+        setCollapsedScopePaths(
+          new Set((persisted?.collapsedScopePaths ?? []).filter((k) => typeof k === "string")),
+        );
+        setExpandedBusKeys(
+          new Set((persisted?.expandedBusKeys ?? []).filter((k) => typeof k === "string")),
+        );
         setTView0(tMin);
         setTView1(tMax);
-        setFocusTraceKey(null);
-        setSelected(new Set(selectedKeys));
+        setFocusTraceKey(
+          persisted?.focusTraceKey && available.has(persisted.focusTraceKey)
+            ? persisted.focusTraceKey
+            : null,
+        );
+        setSelected(new Set(selectedKeys.length > 0 ? selectedKeys : defaultSelected));
         queueMicrotask(() => flushQueryRef.current());
       } catch (e) {
         if (!cancelled) {
@@ -889,6 +1004,15 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       void invoke("vcd_close").catch(() => {});
     };
   }, [projectRoot, vcdPath]);
+
+  useEffect(() => {
+    savePersistedUiState(vcdPath, {
+      selected: Array.from(selected),
+      focusTraceKey,
+      expandedBusKeys: Array.from(expandedBusKeys),
+      collapsedScopePaths: Array.from(collapsedScopePaths),
+    });
+  }, [vcdPath, selected, focusTraceKey, expandedBusKeys, collapsedScopePaths]);
 
   useEffect(() => {
     if (focusTraceKey != null && !selected.has(focusTraceKey)) {
@@ -1008,7 +1132,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
           );
           return;
         }
-        setCursorTime(t);
+        pinAt(t);
         const st2 = navRef.current;
         const m = st2.meta;
         if (!m) return;
@@ -1026,7 +1150,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
         onToast?.("error", e instanceof Error ? e.message : String(e));
       }
     },
-    [focusTraceKey, projectRoot, vcdPath, flushQuery, onToast],
+    [focusTraceKey, projectRoot, vcdPath, flushQuery, onToast, pinAt],
   );
 
   const fitEntireTrace = useCallback(() => {
@@ -1330,8 +1454,23 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       row++;
     }
 
-    if (cursorTime !== null && cursorTime >= t0 && cursorTime <= t1) {
-      const cx = Math.round(tToX(cursorTime)) + 0.5;
+    // Dashed hover ("ghost") cursor. Drawn first so the solid pin renders on top.
+    if (hoverTime !== null && hoverTime !== pinnedTime && hoverTime >= t0 && hoverTime <= t1) {
+      const hx = Math.round(tToX(hoverTime)) + 0.5;
+      ctx.save();
+      ctx.strokeStyle = COL_HOVER_LINE;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(hx, RULER_H);
+      ctx.lineTo(hx, h);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Solid pinned cursor (shared with the editor via the debugger store).
+    if (pinnedTime !== null && pinnedTime >= t0 && pinnedTime <= t1) {
+      const cx = Math.round(tToX(pinnedTime)) + 0.5;
       ctx.strokeStyle = COL_SAMPLE_LINE;
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -1342,7 +1481,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
       ctx.textBaseline = "top";
       ctx.textAlign = "left";
-      const tag = formatSampleTimeLabelWithMeta(cursorTime, tickStep, meta, t0, t1);
+      const tag = formatSampleTimeLabelWithMeta(pinnedTime, tickStep, meta, t0, t1);
       const tw = ctx.measureText(tag).width;
       let lx = cx + 6;
       if (lx + tw > w - 4) lx = Math.max(4, cx - tw - 6);
@@ -1360,7 +1499,8 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     selectedArr,
     tView0,
     tView1,
-    cursorTime,
+    hoverTime,
+    pinnedTime,
     signalInfo,
     busRadix,
   ]);
@@ -1473,24 +1613,40 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     if (!p.down) return;
     const wasPan = p.panning;
     if (!wasPan) {
-      const my = p.canvasMy;
-      if (my < RULER_H) {
-        p.down = false;
-        p.panning = false;
-        return;
-      }
-      const row = Math.floor((my - RULER_H) / ROW_H);
-      const arr = viewMetaRef.current.selectedArr;
-      if (row >= 0 && row < arr.length) {
-        const tid = arr[row]!;
-        setFocusTraceKey((prev) => (prev === tid ? null : tid));
+      const c = canvasRef.current;
+      const m = viewMetaRef.current.meta;
+      const v0 = viewMetaRef.current.tView0;
+      const v1 = viewMetaRef.current.tView1;
+      if (c && m) {
+        const rect = c.getBoundingClientRect();
+        const mx = p.clientStartX - rect.left;
+        if (mx >= 0 && mx <= rect.width) {
+          const [t0, t1] = clampViewToMeta(v0, v1, m);
+          const span = t1 - t0 || 1;
+          const plotW = rect.width || 1;
+          let tClick = t0 + (mx / plotW) * span;
+          if (snapTargetTraceKey != null && snapEdgeTimes.length > 0) {
+            let bestT = tClick;
+            let bestDx = SNAP_PX + 1;
+            for (const te of snapEdgeTimes) {
+              const xe = ((te - t0) / span) * plotW;
+              const d = Math.abs(xe - mx);
+              if (d < bestDx) {
+                bestDx = d;
+                bestT = te;
+              }
+            }
+            if (bestDx <= SNAP_PX) tClick = bestT;
+          }
+          pinAt(tClick);
+        }
       }
     } else {
       flushQuery();
     }
     p.down = false;
     p.panning = false;
-  }, [flushQuery]);
+  }, [flushQuery, pinAt, snapTargetTraceKey, snapEdgeTimes]);
 
   useEffect(() => {
     window.addEventListener("mouseup", endPointer);
@@ -1547,7 +1703,13 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       }
       if (bestDx <= SNAP_PX) tHover = bestT;
     }
-    setCursorTime(tHover);
+    setHoverTime(tHover);
+
+    if (p.down && p.panning) {
+      // Ctrl/Cmd+drag in the ruler band: scrub the pinned cursor continuously.
+      const inRuler = (e.clientY - rect.top) < RULER_H;
+      if (inRuler) pinAt(tHover);
+    }
 
     if (!p.down || !p.panning) return;
     const dx = e.clientX - p.lastX;
@@ -1565,7 +1727,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     if (p.down && p.panning) flushQuery();
     p.down = false;
     p.panning = false;
-    setCursorTime(null);
+    setHoverTime(null);
   };
 
   return (
@@ -1795,6 +1957,9 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
                     <div
                       key={traceKey}
                       title={`${name} @ ${formatVcdTickForTooltip(cursorTime, meta, tView0, tView1)}`}
+                      onClick={() =>
+                        setFocusTraceKey((prev) => (prev === traceKey ? null : traceKey))
+                      }
                       style={{
                         height: ROW_H,
                         boxSizing: "border-box",
@@ -1806,6 +1971,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
                         flexDirection: "column",
                         justifyContent: "center",
                         gap: 3,
+                        cursor: "pointer",
                       }}
                     >
                       <div

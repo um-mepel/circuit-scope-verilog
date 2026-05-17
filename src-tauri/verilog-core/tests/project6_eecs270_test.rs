@@ -20,6 +20,7 @@ fn run_testbench6_vcd(num_cycles: usize) -> String {
     let mut project = IrProject {
         modules: vec![],
         diagnostics: vec![],
+        source_map: verilog_core::source_map::SourceMap::new(),
     };
     for name in ["TestBench6.v", "TLC.v", "B4to7SEG.v"] {
         let p = dir.join(name);

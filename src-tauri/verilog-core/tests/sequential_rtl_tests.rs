@@ -25,6 +25,7 @@ fn merge_vcd(paths_and_src: &[(&str, &str)], top: &str, cycles: usize) -> String
     let mut project = IrProject {
         modules: vec![],
         diagnostics: vec![],
+        source_map: verilog_core::source_map::SourceMap::new(),
     };
     for (p, s) in paths_and_src {
         let mut m = build_ir_for_file((*p).to_string(), s);

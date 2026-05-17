@@ -9,6 +9,7 @@ import { APP_VERSION } from "./appVersion";
 import { logAction } from "./logger";
 import {
   Activity,
+  Bug,
   FilePlus,
   FileText,
   FolderOpen,
@@ -20,7 +21,9 @@ import { TerminalPane } from "./components/TerminalPane";
 import { WaveformPanel } from "./components/WaveformPanel";
 import { VerilogEditor } from "./components/VerilogEditor";
 import { IconButton } from "./components/IconButton";
+import { DebuggerToolbar } from "./components/DebuggerToolbar";
 import { useToastStack } from "./components/ToastStack";
+import { useDebuggerStore } from "./state/debuggerStore";
 import { theme } from "./ui/theme";
 
 const EDITOR_FONT_STORAGE_KEY = "circuitscope_editor_font_px";
@@ -489,6 +492,73 @@ export default function App() {
     [setWarningForPath, projectRoot, pushToast]
   );
 
+  const debuggerSessionId = useDebuggerStore((s) => s.sessionId);
+  const debuggerVcdPath = useDebuggerStore((s) => s.vcdPath);
+  const debuggerVcdTick = useDebuggerStore((s) => s.vcdTick);
+  const startDebuggerSession = useDebuggerStore((s) => s.start);
+  const stepDebugger = useDebuggerStore((s) => s.step);
+  const stopDebugger = useDebuggerStore((s) => s.stop);
+  const lastBreakpointHit = useDebuggerStore((s) => s.lastHit);
+  const clearLastBreakpointHit = useDebuggerStore((s) => s.clearLastHit);
+
+  // Surface a toast + open the hit file when a breakpoint fires during a
+  // step. We clear the store's `lastHit` right after so a subsequent step
+  // that lands on the *same* breakpoint still re-runs this effect.
+  useEffect(() => {
+    if (!lastBreakpointHit) return;
+    const { path, line } = lastBreakpointHit;
+    pushToast("warning", `Breakpoint hit at ${path}:${line}`);
+    void openFileByPath(path);
+    clearLastBreakpointHit();
+  }, [lastBreakpointHit, pushToast, openFileByPath, clearLastBreakpointHit]);
+
+  /** Start a resumable debug session and auto-open the waveform panel. */
+  const handleStartDebug = useCallback(async () => {
+    if (!projectRoot) {
+      pushToast("error", "Open a folder first, then start a debug session.");
+      return;
+    }
+    const res = await startDebuggerSession({
+      projectRoot,
+      vcdFilename: "debug.vcd",
+    });
+    if (res) {
+      setWaveformPath(res.vcdPath);
+      setWaveformVisible(true);
+      setWaveformMountKey((k) => k + 1);
+      void logAction("debug_session_started", {
+        sessionId: res.sessionId,
+        vcdPath: res.vcdPath,
+      });
+    }
+  }, [projectRoot, startDebuggerSession, pushToast]);
+
+  /** Remount waveform panel every time the debugger flushes a new VCD. */
+  useEffect(() => {
+    if (debuggerSessionId == null) return;
+    if (!debuggerVcdPath) return;
+    setWaveformPath(debuggerVcdPath);
+    setWaveformVisible(true);
+    setWaveformMountKey((k) => k + 1);
+  }, [debuggerVcdTick, debuggerSessionId, debuggerVcdPath]);
+
+  /**
+   * When the debug session ends, drop the waveform panel so the (now deleted)
+   * `debug.vcd` doesn't remain as a ghost entry in the viewer. Runs only on
+   * the `active -> null` transition so it doesn't interfere with users who
+   * want to view a freshly generated non-debug VCD.
+   */
+  const wasDebugActiveRef = useRef(false);
+  useEffect(() => {
+    const active = debuggerSessionId != null;
+    if (wasDebugActiveRef.current && !active) {
+      setWaveformVisible(false);
+      setWaveformPath(null);
+      void invoke("vcd_close").catch(() => {});
+    }
+    wasDebugActiveRef.current = active;
+  }, [debuggerSessionId]);
+
   /** File → Generate VCD — `simulate_vcd` runs the same pipeline as the `csverilog` CLI in-process (no `cargo` subprocess). */
   const handleGenerateVcd = useCallback(async () => {
     if (!projectRoot) {
@@ -625,6 +695,44 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!projectRoot) return;
+      const isShift = e.shiftKey;
+      switch (e.key) {
+        case "F5":
+          e.preventDefault();
+          if (isShift) {
+            void stopDebugger();
+          } else if (debuggerSessionId == null) {
+            void handleStartDebug();
+          } else {
+            void stepDebugger("run");
+          }
+          return;
+        case "F8":
+          if (debuggerSessionId == null) return;
+          e.preventDefault();
+          void stepDebugger("cycle");
+          return;
+        case "F10":
+          if (debuggerSessionId == null) return;
+          e.preventDefault();
+          void stepDebugger("statement");
+          return;
+        case "F11":
+          if (debuggerSessionId == null) return;
+          e.preventDefault();
+          void stepDebugger("tick");
+          return;
+        default:
+          return;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [projectRoot, debuggerSessionId, handleStartDebug, stepDebugger, stopDebugger]);
 
   /** Menu / shortcut: open terminal only if closed (does not toggle). */
   const handleOpenNewTerminal = useCallback(() => {
@@ -913,6 +1021,18 @@ export default function App() {
           >
             <Activity size={20} strokeWidth={1.75} />
           </IconButton>
+          <IconButton
+            label={
+              debuggerSessionId == null
+                ? "Start debug session (F5)"
+                : "Restart debug session"
+            }
+            onClick={() => void handleStartDebug()}
+            disabled={!projectRoot}
+            aria-pressed={debuggerSessionId != null}
+          >
+            <Bug size={20} strokeWidth={1.75} />
+          </IconButton>
         </div>
         <span
           style={{
@@ -1197,17 +1317,34 @@ export default function App() {
                 }}
               >
                 {projectRoot && waveformVisible && waveformPath ? (
-                  <WaveformPanel
-                    key={waveformMountKey}
-                    projectRoot={projectRoot}
-                    vcdPath={waveformPath}
-                    onToast={pushToast}
-                    onClose={() => {
-                      setWaveformVisible(false);
-                      setWaveformPath(null);
-                      void invoke("vcd_close").catch(() => {});
-                    }}
-                  />
+                  <>
+                    {debuggerSessionId != null && (
+                      <DebuggerToolbar
+                        projectRoot={projectRoot}
+                        onSessionStarted={(p) => {
+                          setWaveformPath(p);
+                          setWaveformVisible(true);
+                          setWaveformMountKey((k) => k + 1);
+                        }}
+                        onToast={pushToast}
+                      />
+                    )}
+                    <WaveformPanel
+                      key={waveformMountKey}
+                      projectRoot={projectRoot}
+                      vcdPath={waveformPath}
+                      onToast={pushToast}
+                      onClose={() => {
+                        if (debuggerSessionId != null) {
+                          void stopDebugger();
+                        } else {
+                          setWaveformVisible(false);
+                          setWaveformPath(null);
+                          void invoke("vcd_close").catch(() => {});
+                        }
+                      }}
+                    />
+                  </>
                 ) : (
                   <div
                     style={{
@@ -1229,6 +1366,7 @@ export default function App() {
                       value={file?.content ?? ""}
                       editable={!!file}
                       fontSizePx={editorFontSizePx}
+                      filePath={file?.path ?? null}
                       highlightVerilog={
                         !!file && /\.(v|sv)$/i.test(file.path)
                       }

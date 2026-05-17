@@ -23,16 +23,30 @@ pub mod lexer;
 pub mod optimizer;
 mod parser;
 mod semantic;
+pub mod sim_session;
+pub mod source_map;
+pub mod trace;
 
 pub use crate::ir::{
     build_ir_for_file, build_ir_for_path_bufs, build_ir_for_root, elaborate_parameterized_modules,
     resolve_instance_port_connections, sum_initial_delay_literals_for_source_file, IrAlways,
     IrAssign, IrBinOp, IrCaseArm, IrEdgeKind, IrExpr, IrInitial, IrInstance, IrModule, IrNet,
-    IrPortConn, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp,
+    IrPortConn, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp, StmtBlock,
 };
+pub use crate::source_map::{FileId, LineCol, SourceMap, Span, SpanInfo, SYNTHETIC_FILE};
 pub use crate::lexer::{Token, TokenKind};
 pub use crate::optimizer::{optimize_module, optimize_project, optimize_module_with_metrics, OptimizeMetrics};
-pub use crate::codegen::{generate_vcd, SimConfig, VcdRunMeta};
+pub use crate::codegen::{
+    generate_vcd, generate_vcd_with_trace, new_stepping_simulator, SimConfig, StepMode,
+    StepOutcome, VcdRunMeta,
+};
+pub use crate::sim_session::{
+    DriverQueryResult, SessionId, SessionRegistry, SimRunner, SimSession,
+};
+pub use crate::trace::{
+    driver_latest_at_or_before, trace_at, trace_latest_at_or_before, BranchChoice, DriverEvent,
+    TraceEntry,
+};
 pub use crate::delay_rational::DelayRational;
 pub use crate::csverilog_pipeline::{
     num_cycles_from_initial_delay_sum, run_csverilog_pipeline, scan_timescale_project,

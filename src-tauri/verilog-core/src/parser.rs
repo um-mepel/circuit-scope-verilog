@@ -2,6 +2,85 @@ use crate::delay_rational::DelayRational;
 use crate::lexer::{Token, TokenKind};
 use crate::{Diagnostic, Module, ParseResult, Port, Severity, SourceFile};
 
+/// A list of [`CstStmt`]s carrying parallel byte-range info for each statement.
+///
+/// Looks like a `Vec<CstStmt>` to most consumers thanks to `Deref<Target=[CstStmt]>`;
+/// span info is accessed via [`CstBlock::ranges`] / [`CstBlock::range_of`].
+#[derive(Debug, Clone, Default)]
+pub struct CstBlock {
+    stmts: Vec<CstStmt>,
+    /// Half-open byte ranges `(start, end)` per statement in the source file.
+    ranges: Vec<(u32, u32)>,
+}
+
+impl CstBlock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, stmt: CstStmt, range: (u32, u32)) {
+        self.stmts.push(stmt);
+        self.ranges.push(range);
+    }
+
+    pub fn stmts(&self) -> &[CstStmt] {
+        &self.stmts
+    }
+
+    pub fn ranges(&self) -> &[(u32, u32)] {
+        &self.ranges
+    }
+
+    pub fn range_of(&self, idx: usize) -> Option<(u32, u32)> {
+        self.ranges.get(idx).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.stmts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stmts.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, CstStmt> {
+        self.stmts.iter()
+    }
+
+    pub fn iter_with_ranges(&self) -> impl Iterator<Item = (&CstStmt, (u32, u32))> + '_ {
+        self.stmts.iter().zip(self.ranges.iter().copied())
+    }
+
+    pub fn into_parts(self) -> (Vec<CstStmt>, Vec<(u32, u32)>) {
+        (self.stmts, self.ranges)
+    }
+}
+
+impl std::ops::Deref for CstBlock {
+    type Target = [CstStmt];
+    fn deref(&self) -> &[CstStmt] {
+        &self.stmts
+    }
+}
+
+impl<'a> IntoIterator for &'a CstBlock {
+    type Item = &'a CstStmt;
+    type IntoIter = std::slice::Iter<'a, CstStmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.iter()
+    }
+}
+
+impl FromIterator<(CstStmt, (u32, u32))> for CstBlock {
+    fn from_iter<I: IntoIterator<Item = (CstStmt, (u32, u32))>>(iter: I) -> Self {
+        let mut b = CstBlock::new();
+        for (s, r) in iter {
+            b.push(s, r);
+        }
+        b
+    }
+}
+
 /// Concrete syntax for a parsed Verilog (IEEE 1364) file. Intentionally minimal: records modules
 /// and body items for lowering to IR — not a full SystemVerilog front end.
 #[derive(Debug, Clone)]
@@ -37,6 +116,9 @@ pub enum CstModuleItem {
     Assign {
         target: AssignTarget,
         expr: Expr,
+        /// Byte range of the `assign … ;` statement (inclusive of the trailing
+        /// semicolon) for driver-trace reporting. `(0, 0)` when unavailable.
+        range: (u32, u32),
     },
     Instance {
         module_name: String,
@@ -47,10 +129,10 @@ pub enum CstModuleItem {
     },
     Always {
         sensitivity: Sensitivity,
-        body: Vec<CstStmt>,
+        body: CstBlock,
     },
     Initial {
-        body: Vec<CstStmt>,
+        body: CstBlock,
     },
     /// `localparam` / `parameter` assignments (`localparam a = 1, b = 2;`).
     LocalParam {
@@ -66,6 +148,41 @@ pub enum CstModuleItem {
         instance_stem: String,
         connections: Vec<PortConnection>,
     },
+    /// `generate for (i=0; i<N; i=i+1) begin assign y[i] = …; end` —
+    /// expanded during IR lowering to N continuous assigns with the loop
+    /// variable substituted. Mirrors [`GenerateFor`] but the body is a list
+    /// of `assign` statements instead of a single instance.
+    GenerateForAssigns {
+        loop_var: String,
+        upper_expr: Expr,
+        assigns: Vec<(AssignTarget, Expr, (u32, u32))>,
+    },
+    /// Most general `generate for` form: body is an arbitrary list of module
+    /// items including nested generate constructs. Used when the body is
+    /// neither "single instance" nor "all continuous assigns". The IR
+    /// elaborator recurses through each iteration with the loop variable
+    /// substituted.
+    GenerateForBody {
+        loop_var: String,
+        upper_expr: Expr,
+        body: Vec<CstModuleItem>,
+    },
+    /// `generate if (cond) <then> else <else> endgenerate`. The condition is
+    /// const-evaluated against module parameters at IR build time and the
+    /// chosen branch is elaborated normally.
+    GenerateIf {
+        cond: Expr,
+        then_body: Vec<CstModuleItem>,
+        else_body: Vec<CstModuleItem>,
+    },
+    /// `generate case (...) <arms> [default: ...] endcase endgenerate`. The
+    /// scrutinee is const-evaluated and the matching arm (or default) is
+    /// elaborated.
+    GenerateCase {
+        scrutinee: Expr,
+        arms: Vec<(Expr, Vec<CstModuleItem>)>,
+        default: Vec<CstModuleItem>,
+    },
 }
 
 /// Port connection: `.port_name(signal_expr)` or **positional** (`expr` only, mapped to child ports by order).
@@ -73,6 +190,12 @@ pub enum CstModuleItem {
 pub struct PortConnection {
     pub port_name: Option<String>,
     pub expr: Expr,
+    /// Byte range `[start, end)` spanning the port connection text in the
+    /// source file. For named connections we span `.port(expr)` including
+    /// both parens; for positional we span just the expression. Used by
+    /// the debugger's "Jump to Driver" for synthesized glue assigns (see
+    /// `flatten_module`).
+    pub range: (u32, u32),
 }
 
 /// Sensitivity list for always blocks.
@@ -95,7 +218,10 @@ pub enum EdgeKind {
     Level,
 }
 
-/// Left-hand side of a procedural assignment (`reg`, `reg[i]`, `reg[msb:lsb]`).
+/// Left-hand side of a procedural assignment (`reg`, `reg[i]`, `reg[msb:lsb]`,
+/// or a Verilog concat like `{a, b[3:0], c}`). Concat components are stored
+/// MSB-first (i.e. the leftmost element in source receives the high bits of
+/// the RHS).
 #[derive(Debug, Clone)]
 pub enum AssignTarget {
     Whole(String),
@@ -105,6 +231,7 @@ pub enum AssignTarget {
         msb: Expr,
         lsb: Expr,
     },
+    Concat(Vec<AssignTarget>),
 }
 
 /// Procedural statement inside an always/initial block.
@@ -114,13 +241,17 @@ pub enum CstStmt {
     NonBlockingAssign { target: AssignTarget, rhs: Expr },
     IfElse {
         cond: Expr,
-        then_body: Vec<CstStmt>,
-        else_body: Vec<CstStmt>,
+        then_body: CstBlock,
+        else_body: CstBlock,
     },
     Case {
+        /// `case` (plain) vs `casez`/`casex` (wildcard-aware). At IR lowering
+        /// time, arms whose value is a literal containing `?`/`x`/`z` are
+        /// translated to a (value, care_mask) pair for masked equality.
+        kind: CaseKind,
         expr: Expr,
         arms: Vec<CaseArm>,
-        default: Vec<CstStmt>,
+        default: CstBlock,
     },
     For {
         init_var: String,
@@ -128,16 +259,25 @@ pub enum CstStmt {
         cond: Expr,
         step_var: String,
         step_expr: Expr,
-        body: Vec<CstStmt>,
+        body: CstBlock,
     },
     Delay(DelayRational),
     SystemTask { name: String, args: Vec<Expr> },
 }
 
+/// Distinguishes `case` from `casez`/`casex` so the lowering can choose
+/// exact vs wildcard-aware matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseKind {
+    Plain,
+    Z,
+    X,
+}
+
 #[derive(Debug, Clone)]
 pub struct CaseArm {
     pub value: Expr,
-    pub body: Vec<CstStmt>,
+    pub body: CstBlock,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -233,11 +373,38 @@ pub(crate) fn parse_file(file: &SourceFile, tokens: &[Token]) -> ParseResult {
     ParseResult { modules, diagnostics }
 }
 
+/// Module-local function declaration captured for inlining at expression
+/// parse time. Only the single-assignment body form
+/// `begin name = <expr>; end` is currently supported; richer bodies are
+/// rejected at declaration time.
+#[derive(Debug, Clone)]
+struct FuncDef {
+    name: String,
+    /// Formal-parameter names, in declaration order.
+    args: Vec<String>,
+    /// RHS expression of the single `name = <expr>;` body statement.
+    body_expr: Expr,
+}
+
+/// Module-local task declaration captured for inlining at statement parse
+/// time. Only single-statement bodies are currently supported; richer bodies
+/// would need block-splicing.
+#[derive(Debug, Clone)]
+struct TaskDef {
+    name: String,
+    args: Vec<String>,
+    body_stmt: CstStmt,
+}
+
 struct Parser<'a> {
     file: &'a SourceFile,
     tokens: &'a [Token],
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// Per-module function table; cleared at the start of each module.
+    functions: Vec<FuncDef>,
+    /// Per-module task table.
+    tasks: Vec<TaskDef>,
 }
 
 impl<'a> Parser<'a> {
@@ -247,6 +414,8 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            functions: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 
@@ -258,6 +427,20 @@ impl<'a> Parser<'a> {
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
         }
+    }
+
+    /// End byte offset of the most recently consumed token; 0 if none.
+    fn last_end(&self) -> u32 {
+        if self.pos == 0 {
+            0
+        } else {
+            self.tokens[self.pos - 1].end as u32
+        }
+    }
+
+    /// Start byte offset of the next token to be consumed.
+    fn cur_start(&self) -> u32 {
+        self.current().offset as u32
     }
 
     fn match_kind(&mut self, kind: TokenKind) -> bool {
@@ -413,11 +596,20 @@ impl<'a> Parser<'a> {
             // already reported above
         }
 
+        // Each module has its own function/task table — clear any state from a
+        // previous module so call resolution doesn't leak across boundaries.
+        self.functions.clear();
+        self.tasks.clear();
+
         let mut items = Vec::new();
         while self.current().kind != TokenKind::Endmodule
             && self.current().kind != TokenKind::Eof
         {
-            if self.current().kind == TokenKind::Genvar {
+            if self.current().kind == TokenKind::Function {
+                self.parse_function_decl();
+            } else if self.current().kind == TokenKind::Task {
+                self.parse_task_decl();
+            } else if self.current().kind == TokenKind::Genvar {
                 self.skip_genvar_statement();
             } else if self.current().kind == TokenKind::Generate {
                 let mut inner = self.parse_generate_construct();
@@ -564,6 +756,224 @@ impl<'a> Parser<'a> {
     /// `generate … endgenerate` with `for (i=0; i<W; i=i+1) begin : … <one instance>; end`.
     fn parse_generate_construct(&mut self) -> Vec<CstModuleItem> {
         self.bump(); // generate
+        // After `generate`, dispatch on the construct keyword. The body of
+        // each construct may itself contain nested for / if / case via the
+        // shared `parse_generate_item` helper.
+        let items = self.parse_generate_items_until(TokenKind::Endgenerate);
+        let _ = self.match_kind(TokenKind::Endgenerate);
+        return items;
+    }
+
+    /// Parse zero or more generate-body items until `terminator`. Items may
+    /// be `assign`, an instance, or another `for`/`if`/`case`.
+    fn parse_generate_items_until(&mut self, terminator: TokenKind) -> Vec<CstModuleItem> {
+        let mut items = Vec::new();
+        while self.current().kind != terminator
+            && self.current().kind != TokenKind::Eof
+        {
+            if let Some(item) = self.parse_generate_item() {
+                items.push(item);
+            } else {
+                // Recover: skip an unrecognized token so we don't loop forever.
+                self.bump();
+            }
+        }
+        items
+    }
+
+    /// Parse a single generate-body item, dispatching on the leading token.
+    /// Returns `None` for unrecognized starts so the caller can recover.
+    fn parse_generate_item(&mut self) -> Option<CstModuleItem> {
+        match self.current().kind {
+            TokenKind::For => self.parse_generate_for_after_keyword(),
+            TokenKind::If => self.parse_generate_if_after_keyword(),
+            TokenKind::Case => self.parse_generate_case_after_keyword(),
+            TokenKind::Assign => self.parse_assign(),
+            TokenKind::Identifier => self.parse_instance_like(),
+            TokenKind::Begin => {
+                // Bare `begin ... end` group: treat as a transparent container
+                // by parsing items and returning the first one. (Multiple
+                // items in a bare begin block are rare in generate bodies; if
+                // we need to support them we'd add a `Group` variant.)
+                self.bump();
+                if self.current().kind == TokenKind::Colon {
+                    self.bump();
+                    let _ = self.expect_identifier("expected block name after begin:");
+                }
+                let inner = self.parse_generate_items_until(TokenKind::End);
+                let _ = self.match_kind(TokenKind::End);
+                inner.into_iter().next()
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse `for (i = init; i < N; i = step) begin ... end`. Caller has
+    /// already positioned past nothing — the `for` keyword is current.
+    fn parse_generate_for_after_keyword(&mut self) -> Option<CstModuleItem> {
+        self.bump(); // for
+        if !self.match_kind(TokenKind::LParen) {
+            return None;
+        }
+        let loop_var = self.expect_identifier("expected loop variable")?;
+        if !self.match_kind(TokenKind::Eq) {
+            return None;
+        }
+        let _init = self.parse_expression(0);
+        if !self.match_kind(TokenKind::Semicolon) {
+            return None;
+        }
+        let _iter = self.expect_identifier("expected loop variable")?;
+        if !self.match_kind(TokenKind::Lt) {
+            return None;
+        }
+        let upper_expr = self.parse_expression(0);
+        if !self.match_kind(TokenKind::Semicolon) {
+            return None;
+        }
+        let _lhs = self.expect_identifier("expected loop variable")?;
+        if !self.match_kind(TokenKind::Eq) {
+            return None;
+        }
+        let _step = self.parse_expression(0);
+        if !self.match_kind(TokenKind::RParen) {
+            return None;
+        }
+        if !self.match_kind(TokenKind::Begin) {
+            return None;
+        }
+        if self.current().kind == TokenKind::Colon {
+            self.bump();
+            let _ = self.expect_identifier("expected block name after begin:");
+        }
+        let body = self.parse_generate_items_until(TokenKind::End);
+        let _ = self.match_kind(TokenKind::End);
+
+        // Shape detection — keep the existing IR paths for well-tested cases:
+        // (a) exactly one instance → GenerateFor (single-instance variant)
+        // (b) all continuous assigns → GenerateForAssigns
+        // (c) anything else (nested generates, mixed) → GenerateForBody
+        if body.len() == 1 {
+            if let CstModuleItem::Instance {
+                module_name,
+                parameter_assignments,
+                instance_name,
+                connections,
+            } = body[0].clone()
+            {
+                return Some(CstModuleItem::GenerateFor {
+                    loop_var,
+                    upper_expr,
+                    module_name,
+                    parameter_assignments,
+                    instance_stem: instance_name,
+                    connections,
+                });
+            }
+        }
+        let all_assigns = !body.is_empty()
+            && body
+                .iter()
+                .all(|i| matches!(i, CstModuleItem::Assign { .. }));
+        if all_assigns {
+            let mut assigns = Vec::with_capacity(body.len());
+            for item in body {
+                if let CstModuleItem::Assign { target, expr, range } = item {
+                    assigns.push((target, expr, range));
+                }
+            }
+            return Some(CstModuleItem::GenerateForAssigns {
+                loop_var,
+                upper_expr,
+                assigns,
+            });
+        }
+        Some(CstModuleItem::GenerateForBody {
+            loop_var,
+            upper_expr,
+            body,
+        })
+    }
+
+    /// Parse `if (cond) <body> [else <body>]` where each body is either a
+    /// single generate item or `begin ... end` group.
+    fn parse_generate_if_after_keyword(&mut self) -> Option<CstModuleItem> {
+        self.bump(); // if
+        if !self.match_kind(TokenKind::LParen) {
+            return None;
+        }
+        let cond = self.parse_expression(0);
+        let _ = self.match_kind(TokenKind::RParen);
+        let then_body = self.parse_generate_branch_body();
+        let else_body = if self.current().kind == TokenKind::Else {
+            self.bump();
+            self.parse_generate_branch_body()
+        } else {
+            Vec::new()
+        };
+        Some(CstModuleItem::GenerateIf {
+            cond,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// Body of a generate-if / generate-case arm: either `begin ... end`
+    /// with multiple items, or a single bare item.
+    fn parse_generate_branch_body(&mut self) -> Vec<CstModuleItem> {
+        if self.current().kind == TokenKind::Begin {
+            self.bump();
+            if self.current().kind == TokenKind::Colon {
+                self.bump();
+                let _ = self.expect_identifier("expected block name after begin:");
+            }
+            let items = self.parse_generate_items_until(TokenKind::End);
+            let _ = self.match_kind(TokenKind::End);
+            items
+        } else if let Some(item) = self.parse_generate_item() {
+            vec![item]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Parse `case (scrutinee) <arms> [default: <body>] endcase`.
+    fn parse_generate_case_after_keyword(&mut self) -> Option<CstModuleItem> {
+        self.bump(); // case
+        if !self.match_kind(TokenKind::LParen) {
+            return None;
+        }
+        let scrutinee = self.parse_expression(0);
+        let _ = self.match_kind(TokenKind::RParen);
+        let mut arms = Vec::new();
+        let mut default = Vec::new();
+        while self.current().kind != TokenKind::Endcase
+            && self.current().kind != TokenKind::Eof
+        {
+            if self.current().kind == TokenKind::Default {
+                self.bump();
+                let _ = self.match_kind(TokenKind::Colon);
+                default = self.parse_generate_branch_body();
+            } else {
+                let value = self.parse_expression(0);
+                let _ = self.match_kind(TokenKind::Colon);
+                let body = self.parse_generate_branch_body();
+                arms.push((value, body));
+            }
+        }
+        let _ = self.match_kind(TokenKind::Endcase);
+        Some(CstModuleItem::GenerateCase {
+            scrutinee,
+            arms,
+            default,
+        })
+    }
+
+    /// Old entry point preserved as a stub for any callers; the body is
+    /// fully handled by `parse_generate_construct` now.
+    #[allow(dead_code)]
+    fn _legacy_parse_generate_for_stub(&mut self) -> Vec<CstModuleItem> {
+        // Begin original body for reference; never executed.
         if self.current().kind != TokenKind::For {
             self.skip_to_endgenerate();
             return Vec::new();
@@ -628,6 +1038,29 @@ impl<'a> Parser<'a> {
         if self.current().kind == TokenKind::Colon {
             self.bump();
             let _ = self.expect_identifier("expected block name after begin:");
+        }
+        // Body discriminator: `assign` => generate-for-of-assigns, anything
+        // else => fall back to the existing single-instance form.
+        if self.current().kind == TokenKind::Assign {
+            let mut assigns = Vec::new();
+            while self.current().kind == TokenKind::Assign {
+                if let Some(CstModuleItem::Assign { target, expr, range }) = self.parse_assign() {
+                    assigns.push((target, expr, range));
+                }
+            }
+            if !self.match_kind(TokenKind::End) {
+                self.skip_to_endgenerate();
+                return Vec::new();
+            }
+            if !self.match_kind(TokenKind::Endgenerate) {
+                self.skip_to_endgenerate();
+                return Vec::new();
+            }
+            return vec![CstModuleItem::GenerateForAssigns {
+                loop_var,
+                upper_expr,
+                assigns,
+            }];
         }
         let inst = match self.parse_instance_like() {
             Some(CstModuleItem::Instance {
@@ -763,6 +1196,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign(&mut self) -> Option<CstModuleItem> {
+        let start = self.current().offset as u32;
         self.bump(); // consume 'assign'
         let reg = match self.expect_identifier("expected left-hand side of assign") {
             Some(name) => name,
@@ -774,8 +1208,19 @@ impl<'a> Parser<'a> {
         let target = self.parse_assign_target_suffix(reg);
         let _ = self.match_kind(TokenKind::Eq);
         let expr = self.parse_expression(0);
+        // Capture the terminating `;`'s end before consuming it; falls back
+        // to the prior token's end when recovery landed on something else.
+        let end = if self.current().kind == TokenKind::Semicolon {
+            self.current().end as u32
+        } else {
+            self.current().offset as u32
+        };
         self.skip_to_semicolon();
-        Some(CstModuleItem::Assign { target, expr })
+        Some(CstModuleItem::Assign {
+            target,
+            expr,
+            range: (start, end),
+        })
     }
 
     fn parse_instance_like(&mut self) -> Option<CstModuleItem> {
@@ -817,21 +1262,33 @@ impl<'a> Parser<'a> {
                 && self.current().kind != TokenKind::Eof
             {
                 if self.current().kind == TokenKind::Dot {
+                    let conn_start = self.current().offset as u32;
                     self.bump(); // consume '.'
                     if let Some(port_name) = self.expect_identifier("expected port name") {
                         let _ = self.match_kind(TokenKind::LParen);
                         let expr = self.parse_expression(0);
+                        let conn_end = if self.current().kind == TokenKind::RParen {
+                            self.current().end as u32
+                        } else {
+                            self.current().offset as u32
+                        };
                         let _ = self.match_kind(TokenKind::RParen);
                         connections.push(PortConnection {
                             port_name: Some(port_name),
                             expr,
+                            range: (conn_start, conn_end),
                         });
                     }
                 } else {
+                    let conn_start = self.current().offset as u32;
                     let expr = self.parse_expression(0);
+                    // `self.current()` now points at `,` or `)` (or recovery
+                    // target); its offset is the exclusive end of the expr.
+                    let conn_end = self.current().offset as u32;
                     connections.push(PortConnection {
                         port_name: None,
                         expr,
+                        range: (conn_start, conn_end.max(conn_start)),
                     });
                 }
                 if !self.match_kind(TokenKind::Comma) {
@@ -858,10 +1315,15 @@ impl<'a> Parser<'a> {
         }
         // `always #delay stmt` — procedural delay before the statement (e.g. clock generators).
         if self.current().kind == TokenKind::Hash {
+            let delay_start = self.cur_start();
             let ticks = self.parse_delay_numeric_after_hash();
-            let mut body = vec![CstStmt::Delay(ticks)];
+            let delay_end = self.last_end();
+            let mut body = CstBlock::new();
+            body.push(CstStmt::Delay(ticks), (delay_start, delay_end));
+            let stmt_start = self.cur_start();
             if let Some(s) = self.parse_stmt() {
-                body.push(s);
+                let stmt_end = self.last_end();
+                body.push(s, (stmt_start, stmt_end));
             }
             return Some(CstModuleItem::Always {
                 sensitivity: Sensitivity::Star,
@@ -951,23 +1413,32 @@ impl<'a> Parser<'a> {
         Sensitivity::EdgeList(edges)
     }
 
-    fn parse_stmt_block(&mut self) -> Vec<CstStmt> {
+    fn parse_stmt_block(&mut self) -> CstBlock {
+        let mut block = CstBlock::new();
         if self.match_kind(TokenKind::Begin) {
-            let mut stmts = Vec::new();
             while self.current().kind != TokenKind::End
                 && self.current().kind != TokenKind::Eof
             {
+                let start = self.cur_start();
+                let before = self.pos;
                 if let Some(s) = self.parse_stmt() {
-                    stmts.push(s);
+                    let end = self.last_end();
+                    block.push(s, (start, end));
+                } else if self.pos == before {
+                    // Guarantee progress: skip the current token to avoid infinite loop on
+                    // malformed statements that don't consume anything.
+                    self.bump();
                 }
             }
             let _ = self.match_kind(TokenKind::End);
-            stmts
-        } else if let Some(s) = self.parse_stmt() {
-            vec![s]
         } else {
-            vec![]
+            let start = self.cur_start();
+            if let Some(s) = self.parse_stmt() {
+                let end = self.last_end();
+                block.push(s, (start, end));
+            }
         }
+        block
     }
 
     /// After the register/net identifier: optional `[bit]` or `[msb:lsb]`.
@@ -986,6 +1457,39 @@ impl<'a> Parser<'a> {
         } else {
             AssignTarget::Whole(reg)
         }
+    }
+
+    /// Parse a concat-LHS like `{a, b[3:0], c[2]}` already positioned at the
+    /// opening `{`. Each component is parsed as a simple `AssignTarget` (which
+    /// may itself recurse into a nested concat). The result is MSB-first to
+    /// match Verilog concat semantics.
+    fn parse_concat_lhs(&mut self) -> Option<AssignTarget> {
+        if !self.match_kind(TokenKind::LBrace) {
+            return None;
+        }
+        let mut parts = Vec::new();
+        loop {
+            if self.current().kind == TokenKind::RBrace {
+                break;
+            }
+            let part = if self.current().kind == TokenKind::LBrace {
+                self.parse_concat_lhs()?
+            } else if self.current().kind == TokenKind::Identifier {
+                let reg = self.current().lexeme.clone();
+                self.bump();
+                self.parse_assign_target_suffix(reg)
+            } else {
+                // Bad token in concat-LHS — recover to the closing brace or semi.
+                self.skip_to_semicolon();
+                return None;
+            };
+            parts.push(part);
+            if !self.match_kind(TokenKind::Comma) {
+                break;
+            }
+        }
+        let _ = self.match_kind(TokenKind::RBrace);
+        Some(AssignTarget::Concat(parts))
     }
 
     fn parse_stmt(&mut self) -> Option<CstStmt> {
@@ -1025,17 +1529,22 @@ impl<'a> Parser<'a> {
                 let else_body = if self.match_kind(TokenKind::Else) {
                     self.parse_stmt_block()
                 } else {
-                    vec![]
+                    CstBlock::new()
                 };
                 Some(CstStmt::IfElse { cond, then_body, else_body })
             }
-            TokenKind::Case => {
+            TokenKind::Case | TokenKind::Casez | TokenKind::Casex => {
+                let kind = match self.current().kind {
+                    TokenKind::Casez => CaseKind::Z,
+                    TokenKind::Casex => CaseKind::X,
+                    _ => CaseKind::Plain,
+                };
                 self.bump();
                 let _ = self.match_kind(TokenKind::LParen);
                 let expr = self.parse_expression(0);
                 let _ = self.match_kind(TokenKind::RParen);
                 let mut arms = Vec::new();
-                let mut default = Vec::new();
+                let mut default = CstBlock::new();
                 while self.current().kind != TokenKind::Endcase
                     && self.current().kind != TokenKind::Eof
                 {
@@ -1051,7 +1560,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 let _ = self.match_kind(TokenKind::Endcase);
-                Some(CstStmt::Case { expr, arms, default })
+                Some(CstStmt::Case { kind, expr, arms, default })
             }
             TokenKind::For => {
                 self.bump();
@@ -1072,8 +1581,55 @@ impl<'a> Parser<'a> {
                 let body = self.parse_stmt_block();
                 Some(CstStmt::For { init_var, init_val, cond, step_var, step_expr, body })
             }
+            TokenKind::LBrace => {
+                // Concat-LHS: `{a, b[3:0], c} = rhs;` or `{...} <= rhs;`
+                // We never start an expression statement with `{`, so this
+                // unambiguously begins a concat-LHS assignment.
+                let target = self.parse_concat_lhs()?;
+                if self.current().kind == TokenKind::Le {
+                    self.bump();
+                    let rhs = self.parse_expression(0);
+                    let _ = self.match_kind(TokenKind::Semicolon);
+                    Some(CstStmt::NonBlockingAssign { target, rhs })
+                } else if self.match_kind(TokenKind::Eq) {
+                    let rhs = self.parse_expression(0);
+                    let _ = self.match_kind(TokenKind::Semicolon);
+                    Some(CstStmt::BlockingAssign { target, rhs })
+                } else {
+                    self.skip_to_semicolon();
+                    None
+                }
+            }
             TokenKind::Identifier => {
                 let reg = self.current().lexeme.clone();
+                // Task call: identifier(args); — only when the name matches a
+                // module-local task. We peek without bumping so we can fall
+                // back to the assign path for non-tasks.
+                if self.pos + 1 < self.tokens.len()
+                    && self.tokens[self.pos + 1].kind == TokenKind::LParen
+                    && self.tasks.iter().any(|t| t.name == reg)
+                {
+                    self.bump(); // identifier
+                    self.bump(); // (
+                    let mut actuals = Vec::new();
+                    if self.current().kind != TokenKind::RParen {
+                        actuals.push(self.parse_expression(0));
+                        while self.match_kind(TokenKind::Comma) {
+                            actuals.push(self.parse_expression(0));
+                        }
+                    }
+                    let _ = self.match_kind(TokenKind::RParen);
+                    let _ = self.match_kind(TokenKind::Semicolon);
+                    let def = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.name == reg)
+                        .expect("task present by name")
+                        .clone();
+                    let subs: Vec<(String, Expr)> =
+                        def.args.iter().cloned().zip(actuals.into_iter()).collect();
+                    return Some(subst_stmt_multi(def.body_stmt, &subs));
+                }
                 self.bump();
                 let target = self.parse_assign_target_suffix(reg);
                 if self.current().kind == TokenKind::Le {
@@ -1167,6 +1723,174 @@ impl<'a> Parser<'a> {
         left
     }
 
+    /// Parse `function [W-1:0] name; input [...] a; input [...] b; begin
+    /// name = <expr>; end endfunction` and stash in [`Self::functions`] for
+    /// inlining at expression parse time. Bodies more complex than a single
+    /// `name = expr;` are flagged and skipped.
+    fn parse_function_decl(&mut self) {
+        self.bump(); // function
+        // Optional return width (we only need its presence; widths are
+        // currently inferred from the assigned expression).
+        if self.current().kind == TokenKind::Signed {
+            self.bump();
+        }
+        if self.current().kind == TokenKind::LBracket {
+            self.bump();
+            while self.current().kind != TokenKind::RBracket
+                && self.current().kind != TokenKind::Eof
+            {
+                self.bump();
+            }
+            let _ = self.match_kind(TokenKind::RBracket);
+        }
+        let name = match self.expect_identifier("expected function name") {
+            Some(n) => n,
+            None => {
+                self.skip_to_endfunction();
+                return;
+            }
+        };
+        let _ = self.match_kind(TokenKind::Semicolon);
+        // Argument declarations: zero or more `input [W-1:0] x;` lines.
+        let mut args: Vec<String> = Vec::new();
+        while self.current().kind == TokenKind::Input {
+            self.bump();
+            if matches!(
+                self.current().kind,
+                TokenKind::Wire | TokenKind::Reg | TokenKind::Logic
+            ) {
+                self.bump();
+            }
+            if self.current().kind == TokenKind::Signed {
+                self.bump();
+            }
+            if self.current().kind == TokenKind::LBracket {
+                self.bump();
+                while self.current().kind != TokenKind::RBracket
+                    && self.current().kind != TokenKind::Eof
+                {
+                    self.bump();
+                }
+                let _ = self.match_kind(TokenKind::RBracket);
+            }
+            if let Some(arg) = self.expect_identifier("expected function argument name") {
+                args.push(arg);
+            }
+            let _ = self.match_kind(TokenKind::Semicolon);
+        }
+        // Body: optional `begin` ... `end` wrapping a single `name = expr;`.
+        let saw_begin = self.match_kind(TokenKind::Begin);
+        // Expect `name = expr;` — the assignment to the function-name carries
+        // the return value.
+        let body_expr = if self.current().kind == TokenKind::Identifier
+            && self.current().lexeme == name
+        {
+            self.bump();
+            if !self.match_kind(TokenKind::Eq) {
+                self.skip_to_endfunction();
+                return;
+            }
+            let e = self.parse_expression(0);
+            let _ = self.match_kind(TokenKind::Semicolon);
+            e
+        } else {
+            // Unsupported richer body — record and skip the rest.
+            self.error_at_current(&format!(
+                "function `{name}` body must be `begin {name} = <expr>; end` for now"
+            ));
+            self.skip_to_endfunction();
+            return;
+        };
+        if saw_begin {
+            let _ = self.match_kind(TokenKind::End);
+        }
+        let _ = self.match_kind(TokenKind::Endfunction);
+        self.functions.push(FuncDef {
+            name,
+            args,
+            body_expr,
+        });
+    }
+
+    fn skip_to_endfunction(&mut self) {
+        while self.current().kind != TokenKind::Endfunction
+            && self.current().kind != TokenKind::Eof
+        {
+            self.bump();
+        }
+        let _ = self.match_kind(TokenKind::Endfunction);
+    }
+
+    /// Parse `task name; input [...] a; begin <stmt>; end endtask` and store
+    /// in [`Self::tasks`] for inlining at statement parse time.
+    fn parse_task_decl(&mut self) {
+        self.bump(); // task
+        let name = match self.expect_identifier("expected task name") {
+            Some(n) => n,
+            None => {
+                self.skip_to_endtask();
+                return;
+            }
+        };
+        let _ = self.match_kind(TokenKind::Semicolon);
+        let mut args: Vec<String> = Vec::new();
+        while self.current().kind == TokenKind::Input
+            || self.current().kind == TokenKind::Output
+            || self.current().kind == TokenKind::Inout
+        {
+            self.bump(); // direction (only `input` is meaningfully used here)
+            if matches!(
+                self.current().kind,
+                TokenKind::Wire | TokenKind::Reg | TokenKind::Logic
+            ) {
+                self.bump();
+            }
+            if self.current().kind == TokenKind::Signed {
+                self.bump();
+            }
+            if self.current().kind == TokenKind::LBracket {
+                self.bump();
+                while self.current().kind != TokenKind::RBracket
+                    && self.current().kind != TokenKind::Eof
+                {
+                    self.bump();
+                }
+                let _ = self.match_kind(TokenKind::RBracket);
+            }
+            if let Some(arg) = self.expect_identifier("expected task argument name") {
+                args.push(arg);
+            }
+            let _ = self.match_kind(TokenKind::Semicolon);
+        }
+        let saw_begin = self.match_kind(TokenKind::Begin);
+        let body_stmt = match self.parse_stmt() {
+            Some(s) => s,
+            None => {
+                self.error_at_current(&format!("task `{name}` body could not be parsed"));
+                self.skip_to_endtask();
+                return;
+            }
+        };
+        if saw_begin {
+            let _ = self.match_kind(TokenKind::End);
+        }
+        let _ = self.match_kind(TokenKind::Endtask);
+        self.tasks.push(TaskDef {
+            name,
+            args,
+            body_stmt,
+        });
+    }
+
+    fn skip_to_endtask(&mut self) {
+        while self.current().kind != TokenKind::Endtask
+            && self.current().kind != TokenKind::Eof
+        {
+            self.bump();
+        }
+        let _ = self.match_kind(TokenKind::Endtask);
+    }
+
     fn parse_unary(&mut self) -> Expr {
         match self.current().kind {
             TokenKind::Tilde => {
@@ -1201,6 +1925,35 @@ impl<'a> Parser<'a> {
                     let arg = self.parse_expression(0);
                     let _ = self.match_kind(TokenKind::RParen);
                     Expr::Clog2(Box::new(arg))
+                } else if self.current().kind == TokenKind::LParen
+                    && self.functions.iter().any(|f| f.name == name)
+                {
+                    // Function call — parse actuals, substitute formals,
+                    // return the inlined body expression.
+                    self.bump(); // (
+                    let mut actuals = Vec::new();
+                    if self.current().kind != TokenKind::RParen {
+                        actuals.push(self.parse_expression(0));
+                        while self.match_kind(TokenKind::Comma) {
+                            actuals.push(self.parse_expression(0));
+                        }
+                    }
+                    let _ = self.match_kind(TokenKind::RParen);
+                    let def = self
+                        .functions
+                        .iter()
+                        .find(|f| f.name == name)
+                        .expect("function present by name in table")
+                        .clone();
+                    // Right-pad / left-truncate to formal arity. Mismatch is
+                    // diagnosed but not fatal — extra actuals are ignored,
+                    // missing ones leave the formal name unbound.
+                    let mut subs: Vec<(String, Expr)> =
+                        def.args.iter().cloned().zip(actuals.into_iter()).collect();
+                    // If too few actuals, leave the unbound formals unreplaced
+                    // (they'll resolve to the surrounding scope's identifier).
+                    let _ = &mut subs;
+                    subst_expr_multi(def.body_expr, &subs)
                 } else {
                     Expr::Ident(name)
                 }
@@ -1273,7 +2026,31 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn subst_expr_loop_var(e: Expr, loop_var: &str, k: i64) -> Expr {
+/// Replace every occurrence of the identifier `loop_var` in an [`AssignTarget`]
+/// with the integer literal `k`. Used by IR lowering when unrolling a
+/// generate-for of assigns. Mirrors [`subst_expr_loop_var`] for the LHS.
+pub(crate) fn subst_target_loop_var(t: AssignTarget, loop_var: &str, k: i64) -> AssignTarget {
+    match t {
+        AssignTarget::Whole(name) => AssignTarget::Whole(name),
+        AssignTarget::BitSelect { reg, index } => AssignTarget::BitSelect {
+            reg,
+            index: subst_expr_loop_var(index, loop_var, k),
+        },
+        AssignTarget::PartSelect { reg, msb, lsb } => AssignTarget::PartSelect {
+            reg,
+            msb: subst_expr_loop_var(msb, loop_var, k),
+            lsb: subst_expr_loop_var(lsb, loop_var, k),
+        },
+        AssignTarget::Concat(parts) => AssignTarget::Concat(
+            parts
+                .into_iter()
+                .map(|p| subst_target_loop_var(p, loop_var, k))
+                .collect(),
+        ),
+    }
+}
+
+pub(crate) fn subst_expr_loop_var(e: Expr, loop_var: &str, k: i64) -> Expr {
     match e {
         Expr::Ident(s) if s == loop_var => Expr::Number(format!("{k}")),
         Expr::Ident(s) => Expr::Ident(s),
@@ -1318,6 +2095,7 @@ pub(crate) fn subst_port_connections(conns: &[PortConnection], loop_var: &str, k
         .map(|c| PortConnection {
             port_name: c.port_name.clone(),
             expr: subst_expr_loop_var(c.expr.clone(), loop_var, k),
+            range: c.range,
         })
         .collect()
 }
@@ -1337,4 +2115,232 @@ fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
         }
     }
     (line, col)
+}
+
+
+/// Substitute `loop_var` -> `k` everywhere inside a [`CstModuleItem`].
+/// Used by the IR generate-body elaborator. Shadowing is respected for
+/// nested generate-for constructs: if the inner loop binds the same name,
+/// its body is left untouched (the inner binding shadows).
+pub(crate) fn subst_module_item_loop_var(
+    item: CstModuleItem,
+    loop_var: &str,
+    k: i64,
+) -> CstModuleItem {
+    match item {
+        CstModuleItem::Assign { target, expr, range } => CstModuleItem::Assign {
+            target: subst_target_loop_var(target, loop_var, k),
+            expr: subst_expr_loop_var(expr, loop_var, k),
+            range,
+        },
+        CstModuleItem::Instance {
+            module_name,
+            parameter_assignments,
+            instance_name,
+            connections,
+        } => CstModuleItem::Instance {
+            module_name,
+            parameter_assignments: parameter_assignments
+                .into_iter()
+                .map(|(n, e)| (n, subst_expr_loop_var(e, loop_var, k)))
+                .collect(),
+            instance_name,
+            connections: subst_port_connections(&connections, loop_var, k),
+        },
+        CstModuleItem::GenerateFor {
+            loop_var: inner_var,
+            upper_expr,
+            module_name,
+            parameter_assignments,
+            instance_stem,
+            connections,
+        } => {
+            // Always substitute upper_expr (it's evaluated in the outer scope).
+            let upper_expr = subst_expr_loop_var(upper_expr, loop_var, k);
+            // Inner loop_var shadows ours — leave inner body untouched.
+            let (parameter_assignments, connections) = if inner_var == loop_var {
+                (parameter_assignments, connections)
+            } else {
+                (
+                    parameter_assignments
+                        .into_iter()
+                        .map(|(n, e)| (n, subst_expr_loop_var(e, loop_var, k)))
+                        .collect(),
+                    subst_port_connections(&connections, loop_var, k),
+                )
+            };
+            CstModuleItem::GenerateFor {
+                loop_var: inner_var,
+                upper_expr,
+                module_name,
+                parameter_assignments,
+                instance_stem,
+                connections,
+            }
+        }
+        CstModuleItem::GenerateForAssigns {
+            loop_var: inner_var,
+            upper_expr,
+            assigns,
+        } => {
+            let upper_expr = subst_expr_loop_var(upper_expr, loop_var, k);
+            let assigns = if inner_var == loop_var {
+                assigns
+            } else {
+                assigns
+                    .into_iter()
+                    .map(|(t, e, r)| (
+                        subst_target_loop_var(t, loop_var, k),
+                        subst_expr_loop_var(e, loop_var, k),
+                        r,
+                    ))
+                    .collect()
+            };
+            CstModuleItem::GenerateForAssigns {
+                loop_var: inner_var,
+                upper_expr,
+                assigns,
+            }
+        }
+        CstModuleItem::GenerateForBody {
+            loop_var: inner_var,
+            upper_expr,
+            body,
+        } => {
+            let upper_expr = subst_expr_loop_var(upper_expr, loop_var, k);
+            let body = if inner_var == loop_var {
+                body
+            } else {
+                body.into_iter()
+                    .map(|i| subst_module_item_loop_var(i, loop_var, k))
+                    .collect()
+            };
+            CstModuleItem::GenerateForBody {
+                loop_var: inner_var,
+                upper_expr,
+                body,
+            }
+        }
+        CstModuleItem::GenerateIf {
+            cond,
+            then_body,
+            else_body,
+        } => CstModuleItem::GenerateIf {
+            cond: subst_expr_loop_var(cond, loop_var, k),
+            then_body: then_body
+                .into_iter()
+                .map(|i| subst_module_item_loop_var(i, loop_var, k))
+                .collect(),
+            else_body: else_body
+                .into_iter()
+                .map(|i| subst_module_item_loop_var(i, loop_var, k))
+                .collect(),
+        },
+        CstModuleItem::GenerateCase {
+            scrutinee,
+            arms,
+            default,
+        } => CstModuleItem::GenerateCase {
+            scrutinee: subst_expr_loop_var(scrutinee, loop_var, k),
+            arms: arms
+                .into_iter()
+                .map(|(v, body)| (
+                    subst_expr_loop_var(v, loop_var, k),
+                    body.into_iter()
+                        .map(|i| subst_module_item_loop_var(i, loop_var, k))
+                        .collect(),
+                ))
+                .collect(),
+            default: default
+                .into_iter()
+                .map(|i| subst_module_item_loop_var(i, loop_var, k))
+                .collect(),
+        },
+        other => other, // NetDecl, Always, Initial, LocalParam, etc. — pass through.
+    }
+}
+
+
+/// Substitute multiple identifiers in an [`Expr`]. Walks the expression and
+/// replaces every `Ident(name)` whose name matches a `(formal, actual)` pair
+/// in `subs` with the actual `Expr`. Used to inline function calls.
+pub(crate) fn subst_expr_multi(e: Expr, subs: &[(String, Expr)]) -> Expr {
+    match e {
+        Expr::Ident(name) => {
+            if let Some((_, actual)) = subs.iter().find(|(f, _)| f == &name) {
+                actual.clone()
+            } else {
+                Expr::Ident(name)
+            }
+        }
+        Expr::Number(n) => Expr::Number(n),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op,
+            left: Box::new(subst_expr_multi(*left, subs)),
+            right: Box::new(subst_expr_multi(*right, subs)),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op,
+            operand: Box::new(subst_expr_multi(*operand, subs)),
+        },
+        Expr::Ternary { cond, then_expr, else_expr } => Expr::Ternary {
+            cond: Box::new(subst_expr_multi(*cond, subs)),
+            then_expr: Box::new(subst_expr_multi(*then_expr, subs)),
+            else_expr: Box::new(subst_expr_multi(*else_expr, subs)),
+        },
+        Expr::Concat(exprs) => Expr::Concat(
+            exprs.into_iter().map(|e| subst_expr_multi(e, subs)).collect(),
+        ),
+        Expr::Index { base, msb, lsb } => Expr::Index {
+            base: Box::new(subst_expr_multi(*base, subs)),
+            msb: Box::new(subst_expr_multi(*msb, subs)),
+            lsb: lsb.map(|x| Box::new(subst_expr_multi(*x, subs))),
+        },
+        Expr::Clog2(a) => Expr::Clog2(Box::new(subst_expr_multi(*a, subs))),
+        Expr::Signed(a) => Expr::Signed(Box::new(subst_expr_multi(*a, subs))),
+    }
+}
+
+/// Substitute identifiers in an [`AssignTarget`] using the same rules as
+/// [`subst_expr_multi`]. When a whole-target identifier matches a formal,
+/// the substitution is dropped on the floor (we can't substitute a plain
+/// reg name with an arbitrary Expr in LHS position) — callers should not
+/// rely on substituting LHS regs for task inlining.
+fn subst_target_multi(t: AssignTarget, subs: &[(String, Expr)]) -> AssignTarget {
+    match t {
+        AssignTarget::Whole(name) => AssignTarget::Whole(name),
+        AssignTarget::BitSelect { reg, index } => AssignTarget::BitSelect {
+            reg,
+            index: subst_expr_multi(index, subs),
+        },
+        AssignTarget::PartSelect { reg, msb, lsb } => AssignTarget::PartSelect {
+            reg,
+            msb: subst_expr_multi(msb, subs),
+            lsb: subst_expr_multi(lsb, subs),
+        },
+        AssignTarget::Concat(parts) => AssignTarget::Concat(
+            parts.into_iter().map(|p| subst_target_multi(p, subs)).collect(),
+        ),
+    }
+}
+
+/// Substitute identifiers in a [`CstStmt`]. Used to inline a task body at a
+/// call site. Walks RHS expressions and bit/part-select indices on LHS.
+pub(crate) fn subst_stmt_multi(s: CstStmt, subs: &[(String, Expr)]) -> CstStmt {
+    match s {
+        CstStmt::BlockingAssign { target, rhs } => CstStmt::BlockingAssign {
+            target: subst_target_multi(target, subs),
+            rhs: subst_expr_multi(rhs, subs),
+        },
+        CstStmt::NonBlockingAssign { target, rhs } => CstStmt::NonBlockingAssign {
+            target: subst_target_multi(target, subs),
+            rhs: subst_expr_multi(rhs, subs),
+        },
+        CstStmt::Delay(d) => CstStmt::Delay(d),
+        CstStmt::SystemTask { name, args } => CstStmt::SystemTask {
+            name,
+            args: args.into_iter().map(|e| subst_expr_multi(e, subs)).collect(),
+        },
+        other => other, // IfElse / Case / For — would need recursive walks; OK for now.
+    }
 }

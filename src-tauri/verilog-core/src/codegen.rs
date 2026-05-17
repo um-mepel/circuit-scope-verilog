@@ -23,8 +23,12 @@ use std::fmt::Write as FmtWrite;
 use crate::delay_rational::DelayRational;
 use crate::ir::{
     ir_try_eval_const_index_expr, IrAlways, IrAssign, IrBinOp, IrCaseArm, IrEdgeKind, IrExpr,
-    IrInitial, IrModule, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp,
+    IrInitial, IrModule, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp, StmtBlock,
 };
+use crate::source_map::Span;
+#[cfg(test)]
+use crate::source_map::{SourceMap, SYNTHETIC_FILE};
+use crate::trace::{BranchChoice, DriverEvent, TraceEntry};
 use crate::timescale_util::{
     clock_half_period_fine_ticks, timescale_token_to_fs, unit_per_precision_ratio,
 };
@@ -133,6 +137,40 @@ fn merge_vcd_run_meta(project: &IrProject, top: &IrModule, config: &mut SimConfi
 /// Returns the VCD content as a `String`, or an error message if the
 /// top module cannot be found.
 pub fn generate_vcd(project: &IrProject, config: &SimConfig) -> Result<String, String> {
+    generate_vcd_with_trace(project, config).map(|(vcd, _trace)| vcd)
+}
+
+/// Like [`generate_vcd`] but also returns the per-statement execution trace collected
+/// while simulating. The trace is sorted by `time_fs`; see
+/// [`crate::trace::TraceEntry`] for the wire format.
+///
+/// This is the entry point that powers the time-synced source debugger: the
+/// frontend uses the trace to highlight which source statements ran at any
+/// given waveform cursor time.
+pub fn generate_vcd_with_trace(
+    project: &IrProject,
+    config: &SimConfig,
+) -> Result<(String, Vec<TraceEntry>), String> {
+    let (config, mut sim) = build_simulator(project, config)?;
+    let vcd = sim.run(&config)?;
+    Ok((vcd, sim.trace))
+}
+
+/// Build a long-lived stepping simulator for the debugger. Returns a trait object
+/// so the concrete `Simulator` stays private and free of lifetime parameters.
+pub fn new_stepping_simulator(
+    project: &IrProject,
+    config: &SimConfig,
+) -> Result<Box<dyn crate::sim_session::SimRunner + Send>, String> {
+    let (config, mut sim) = build_simulator(project, config)?;
+    sim.init_run(&config);
+    Ok(Box::new(SteppingSimulator { sim }))
+}
+
+fn build_simulator(
+    project: &IrProject,
+    config: &SimConfig,
+) -> Result<(SimConfig, Simulator), String> {
     let top = project
         .modules
         .iter()
@@ -146,8 +184,58 @@ pub fn generate_vcd(project: &IrProject, config: &SimConfig) -> Result<String, S
         project.modules.iter().map(|m| (m.name.as_str(), m)).collect();
 
     let unit_fs = timescale_token_to_fs(&config.timescale).unwrap_or(1_000_000u128);
-    let mut sim = Simulator::new(top, &module_map, unit_fs);
-    sim.run(&config)
+    let sim = Simulator::new(top, &module_map, unit_fs);
+    Ok((config, sim))
+}
+
+/// Adapter owned by [`crate::sim_session::SimSession`] — exposes only the
+/// stepping operations the frontend needs.
+struct SteppingSimulator {
+    sim: Simulator,
+}
+
+impl crate::sim_session::SimRunner for SteppingSimulator {
+    fn step_until(&mut self, mode: StepMode, clock_signal: Option<&str>) -> StepOutcome {
+        self.sim.step_until(mode, clock_signal)
+    }
+
+    fn vcd_buffer(&self) -> &str {
+        &self.sim.vcd_buffer
+    }
+
+    fn trace(&self) -> &[TraceEntry] {
+        &self.sim.trace
+    }
+
+    fn driver_events(&self) -> &[DriverEvent] {
+        &self.sim.driver_events
+    }
+
+    fn signal_names(&self) -> &[String] {
+        &self.sim.signal_order
+    }
+
+    fn static_driver(&self, signal: &str) -> Option<Span> {
+        self.sim.static_drivers.get(signal).copied()
+    }
+
+    fn port_alias(&self, signal: &str) -> Option<String> {
+        self.sim.port_aliases.get(signal).cloned()
+    }
+
+    fn signal_index_of(&self, signal: &str) -> Option<u32> {
+        self.sim.signal_idx.get(signal).copied()
+    }
+
+    fn current_time_fs(&self) -> u64 {
+        self.sim.t_sim.min(u64::MAX as u128) as u64
+    }
+
+    fn eval_signal(&self, name: &str) -> Option<(i64, usize)> {
+        let v = self.sim.signals.get(name).copied()?;
+        let w = self.sim.width_for_signal(name);
+        Some((v, w))
+    }
 }
 
 // ── Scope tree for nested VCD scopes ────────────────────────────────
@@ -171,7 +259,7 @@ struct InitialEvent {
 struct AlwaysDelayProc {
     period_fs: u128,
     next_fire_fs: u128,
-    stmts: Vec<IrStmt>,
+    stmts: StmtBlock,
 }
 
 /// Bit width for a scalar `assign` LHS, including unpacked memory elements `stem__index`.
@@ -197,7 +285,7 @@ fn width_for_assign_lhs(
 
 // ── Simulator ───────────────────────────────────────────────────────
 
-struct Simulator<'a> {
+struct Simulator {
     signals: HashMap<String, i64>,
     prev_signals: HashMap<String, i64>,
     signal_order: Vec<String>,
@@ -216,13 +304,86 @@ struct Simulator<'a> {
     /// Element width for each mem stem (packed width of `stem__k`).
     mem_elem_width: HashMap<String, usize>,
     scope_tree: ScopeNode,
-    top: &'a IrModule,
     /// Latest simulation time (femtoseconds) for debug instrumentation.
     last_sim_time_fs: u128,
+    /// Per-statement execution trace. One entry is pushed every time a `IrStmt`
+    /// variant executes inside `exec_stmt`/`exec_stmt_on_env`. See
+    /// [`crate::trace::TraceEntry`].
+    trace: Vec<TraceEntry>,
+    /// Per-write driver provenance. One entry is pushed every time a signal is
+    /// updated by a procedural assign or continuous `assign`, including the
+    /// originating statement span and (where available) the taken ternary
+    /// branch. Consumed by `sim_driver_at` on the frontend. See
+    /// [`crate::trace::DriverEvent`].
+    driver_events: Vec<DriverEvent>,
+    /// Map from hierarchical signal name to its index in [`Self::signal_order`],
+    /// used to key `DriverEvent::signal_idx`. Populated in `Simulator::new`.
+    signal_idx: HashMap<String, u32>,
+    /// Statically-known driver span for every signal assigned anywhere in the
+    /// flattened design: continuous `assign`, `always` (procedural), `initial`,
+    /// or `for`-body writes. Built once at [`Simulator::new`] so "Jump to
+    /// Driver" can still answer when no `DriverEvent` has fired yet (e.g. the
+    /// always block is guarded by a clock edge that has not occurred before
+    /// the pinned time). If a signal has multiple writers we keep the first
+    /// real (non-dummy) span we encounter — the frontend's UI is statement-
+    /// level in the fallback path, so picking any of them is acceptable.
+    static_drivers: HashMap<String, Span>,
+    /// Alias map from port-glue synthesized by [`Self::flatten_module`]:
+    /// when a top-level signal's only driver is `parent = Ident(child)` with
+    /// a dummy span (instance-port wiring), we can't emit a meaningful
+    /// driver event for the parent — but the real driver exists one hop
+    /// away. [`SimSession::driver_at`] follows these aliases so
+    /// "Jump to Driver" on a top-module port (e.g. `HEX4` driven by
+    /// `ffc__HEX4`) lands on the actual writing statement inside the
+    /// submodule instead of reporting "no driver".
+    port_aliases: HashMap<String, String>,
+
+    // ── Resumable-run state (populated by `init_run`) ──────────────
+    /// Accumulating VCD output buffer. For the legacy one-shot [`Self::run`]
+    /// this is flushed to the returned `String`; stepping keeps appending to
+    /// it between calls.
+    vcd_buffer: String,
+    /// Current simulator time in femtoseconds while stepping. Equal to
+    /// `last_sim_time_fs` once at least one step has executed.
+    t_sim: u128,
+    /// Simulation horizon in femtoseconds (inclusive). Stepping returns
+    /// [`StepOutcome::End`] when the scheduler cannot advance past this.
+    end_fs: u128,
+    /// VCD timestamp divisor (precision in fs). One VCD time tick = `prec_fs` fs.
+    prec_fs: u128,
+    /// Whether [`Self::init_run`] has produced the VCD header + `#0` dumpvars.
+    initialized: bool,
+    /// Whether the event loop has fully drained (`t_sim` cannot advance).
+    finished: bool,
 }
 
-impl<'a> Simulator<'a> {
-    fn new(top: &'a IrModule, module_map: &HashMap<&str, &IrModule>, unit_fs: u128) -> Self {
+/// Granularity requested by the debugger toolbar for a single step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMode {
+    /// Run until the next [`IrStmt`] fires inside `exec_stmt`.
+    OneStatement,
+    /// Run until the scheduler advances `t_sim` by at least one event.
+    OneTick,
+    /// Run until the top-module clock produces its next `0 → 1` transition.
+    OneCycle,
+    /// Run the rest of the simulation, same as legacy [`Simulator::run`].
+    ToEnd,
+}
+
+/// Result of one step request; carries enough metadata for the frontend to
+/// update the cursor + highlighted source span list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// Simulator advanced; `t_sim` holds the new time, `ran_statements` how
+    /// many `exec_stmt` invocations happened during this step.
+    Advanced { t_sim: u64, ran_statements: usize },
+    /// Scheduler exhausted; no more events. The frontend should transition to
+    /// "stopped" mode.
+    End,
+}
+
+impl Simulator {
+    fn new(top: &IrModule, module_map: &HashMap<&str, &IrModule>, unit_fs: u128) -> Self {
         let mut signals: HashMap<String, i64> = HashMap::new();
         let mut widths: HashMap<String, usize> = HashMap::new();
         let mut mem_bounds: HashMap<String, (i64, i64)> = HashMap::new();
@@ -267,11 +428,49 @@ impl<'a> Simulator<'a> {
         );
 
         let mut vcd_ids = HashMap::new();
+        let mut signal_idx: HashMap<String, u32> = HashMap::with_capacity(signal_order.len());
         for (i, name) in signal_order.iter().enumerate() {
             vcd_ids.insert(name.clone(), vcd_ident(i));
+            signal_idx.insert(name.clone(), i as u32);
         }
 
         let prev_signals = signals.clone();
+
+        // Build the static driver map: one span per signal that can be
+        // written somewhere in the flattened design. See `static_drivers`.
+        // At the same time, record any port-glue aliases (dummy-span assigns
+        // whose rhs is a plain Ident) so `driver_at` can follow them to the
+        // real source.
+        let mut static_drivers: HashMap<String, Span> = HashMap::new();
+        let mut port_aliases: HashMap<String, String> = HashMap::new();
+        for a in &assigns {
+            if !a.span.is_dummy() {
+                // Prefer real source spans over synthetic port-glue dummies.
+                static_drivers
+                    .entry(a.lhs.clone())
+                    .or_insert(a.span);
+            } else if let IrExpr::Ident(src) = &a.rhs {
+                // Synthesized `parent = child` (or `child = parent` for an
+                // input port). We only register the alias if it's not a
+                // self-reference and we haven't already recorded one for
+                // this lhs — the first hop is enough to reach the real
+                // driver via chain following.
+                if src != &a.lhs {
+                    port_aliases
+                        .entry(a.lhs.clone())
+                        .or_insert_with(|| src.clone());
+                }
+            }
+        }
+        for ab in &always_blocks {
+            Self::collect_static_drivers(&ab.stmts, &mut static_drivers);
+        }
+        for proc in &always_delay_procs {
+            Self::collect_static_drivers(&proc.stmts, &mut static_drivers);
+        }
+        for ib in &initial_blocks {
+            Self::collect_static_drivers(&ib.stmts, &mut static_drivers);
+        }
 
         Simulator {
             signals,
@@ -288,8 +487,104 @@ impl<'a> Simulator<'a> {
             mem_bounds,
             mem_elem_width,
             scope_tree,
-            top,
             last_sim_time_fs: 0,
+            trace: Vec::new(),
+            driver_events: Vec::new(),
+            signal_idx,
+            static_drivers,
+            port_aliases,
+            vcd_buffer: String::with_capacity(4096),
+            t_sim: 0,
+            end_fs: 0,
+            prec_fs: 1,
+            initialized: false,
+            finished: false,
+        }
+    }
+
+    /// Record a driver-provenance event for a write to `lhs`.
+    ///
+    /// `stmt_span` should point to the assigning statement (procedural or
+    /// continuous). `branch` is pre-computed (caller inspects the rhs's
+    /// condition against the appropriate environment — the simulator's
+    /// committed `signals` for continuous assigns, or the per-process
+    /// `scratch` for always blocks).
+    fn record_driver_event(
+        &mut self,
+        lhs: &str,
+        stmt_span: Span,
+        branch: Option<BranchChoice>,
+        value: i64,
+    ) {
+        // Synthesized assigns (port glue from flatten_module, optimizer
+        // rewrites, …) use the dummy span and would just noise up the trace
+        // without giving the editor anything to highlight. Skip them.
+        if stmt_span == Span::dummy() {
+            return;
+        }
+        let Some(idx) = self.signal_idx.get(lhs).copied() else {
+            return;
+        };
+        self.driver_events.push(DriverEvent::new(
+            self.last_sim_time_fs.min(u64::MAX as u128) as u64,
+            idx,
+            stmt_span,
+            branch,
+            value,
+        ));
+    }
+
+    /// Recursively walk `stmts` and remember the first non-dummy span that
+    /// writes to each lhs into `out`. Used to seed the static driver map so
+    /// "Jump to Driver" works for signals whose runtime `DriverEvent` has not
+    /// fired yet (e.g. an `always @(posedge clk)` block that has not yet been
+    /// stepped to). Memory writes record the stem (e.g. `mem__<idx>` resolution
+    /// happens at runtime and is not needed for the fallback).
+    fn collect_static_drivers(stmts: &StmtBlock, out: &mut HashMap<String, Span>) {
+        for (stmt, span) in stmts.iter_with_spans() {
+            match stmt {
+                IrStmt::BlockingAssign { lhs, .. } | IrStmt::NonBlockingAssign { lhs, .. } => {
+                    if span != Span::dummy() {
+                        out.entry(lhs.clone()).or_insert(span);
+                    }
+                }
+                IrStmt::MemAssign { stem, .. } => {
+                    if span != Span::dummy() {
+                        out.entry(stem.clone()).or_insert(span);
+                    }
+                }
+                IrStmt::IfElse {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    Self::collect_static_drivers(then_body, out);
+                    Self::collect_static_drivers(else_body, out);
+                }
+                IrStmt::Case { arms, default, .. } => {
+                    for arm in arms {
+                        Self::collect_static_drivers(&arm.body, out);
+                    }
+                    Self::collect_static_drivers(default, out);
+                }
+                IrStmt::For { body, .. } => {
+                    Self::collect_static_drivers(body, out);
+                }
+                IrStmt::Delay(_) | IrStmt::SystemTask { .. } => {}
+            }
+        }
+    }
+
+    /// Outcome of the top-level ternary (if any) on the rhs, evaluated in `env`.
+    fn top_branch_for_rhs(&self, rhs: &IrExpr, env: &HashMap<String, i64>) -> Option<BranchChoice> {
+        if let IrExpr::Ternary { cond, .. } = rhs {
+            if self.eval_expr_with_env(cond, env) != 0 {
+                Some(BranchChoice::Then)
+            } else {
+                Some(BranchChoice::Else)
+            }
+        } else {
+            None
         }
     }
 
@@ -308,12 +603,14 @@ impl<'a> Simulator<'a> {
             if matches!(&ab.sensitivity, IrSensitivity::Star) {
                 if let Some(IrStmt::Delay(d)) = ab.stmts.first() {
                     let period_fs = d.to_femtoseconds(unit_fs);
-                    let rest = ab.stmts[1..].to_vec();
-                    if period_fs > 0 && !rest.is_empty() {
+                    let (stmts_vec, spans_vec) = ab.stmts.clone().into_parts();
+                    let rest_stmts: Vec<IrStmt> = stmts_vec.into_iter().skip(1).collect();
+                    let rest_spans: Vec<Span> = spans_vec.into_iter().skip(1).collect();
+                    if period_fs > 0 && !rest_stmts.is_empty() {
                         procs.push(AlwaysDelayProc {
                             period_fs,
                             next_fire_fs: period_fs,
-                            stmts: rest,
+                            stmts: StmtBlock::from_parts(rest_stmts, rest_spans),
                         });
                         continue;
                     }
@@ -681,6 +978,7 @@ impl<'a> Simulator<'a> {
             assigns.push(IrAssign {
                 lhs: pfx(&a.lhs),
                 rhs: prefix_ir_expr(&a.rhs, prefix),
+                span: a.span,
             });
         }
 
@@ -742,6 +1040,7 @@ impl<'a> Simulator<'a> {
                         assigns.push(IrAssign {
                             lhs: child_port,
                             rhs: parent_expr,
+                            span: conn.span,
                         });
                     }
                 }
@@ -778,6 +1077,7 @@ impl<'a> Simulator<'a> {
                             assigns.push(IrAssign {
                                 lhs: parent_sig,
                                 rhs: IrExpr::Ident(child_port),
+                                span: Span::dummy(),
                             });
                         } else if let IrExpr::PartSelect { value, msb, lsb } = &parent_expr {
                             if let IrExpr::Ident(vec_name) = value.as_ref() {
@@ -797,6 +1097,7 @@ impl<'a> Simulator<'a> {
                                             assigns.push(IrAssign {
                                                 lhs: vec_name.clone(),
                                                 rhs,
+                                                span: Span::dummy(),
                                             });
                                         }
                                     }
@@ -811,8 +1112,26 @@ impl<'a> Simulator<'a> {
 
     // ── Simulation loop ─────────────────────────────────────────────
 
+    /// Legacy one-shot driver: initialize + run to end, return the full VCD.
+    ///
+    /// Equivalent to [`Self::init_run`] followed by [`Self::step_until`]`(ToEnd)` and
+    /// [`Self::take_vcd`]. Kept so [`generate_vcd`] and every existing caller
+    /// keep their return shape.
     fn run(&mut self, config: &SimConfig) -> Result<String, String> {
-        let mut vcd = String::with_capacity(4096);
+        self.init_run(config);
+        self.step_until(StepMode::ToEnd, None);
+        Ok(std::mem::take(&mut self.vcd_buffer))
+    }
+
+    /// Prepare the simulator for stepping: write the VCD header, apply `initial`
+    /// events at time 0, fixpoint combinational logic, emit `#0 $dumpvars`.
+    ///
+    /// After this, the simulator is at `t_sim == 0` with the initial state
+    /// flushed into [`Self::vcd_buffer`]. Repeated calls are a no-op.
+    fn init_run(&mut self, config: &SimConfig) {
+        if self.initialized {
+            return;
+        }
 
         let k = unit_per_precision_ratio(&config.timescale, &config.timescale_precision);
         let h = clock_half_period_fine_ticks(
@@ -856,13 +1175,15 @@ impl<'a> Simulator<'a> {
             .max(self.initial_time_horizon_fs)
             .max(proc_horizon_fs);
 
+        self.end_fs = end_fs;
+        self.prec_fs = prec_fs;
+
+        let mut vcd = std::mem::take(&mut self.vcd_buffer);
         self.write_header(&mut vcd, config, h);
+        self.vcd_buffer = vcd;
 
         self.apply_initial_events_at_fs(0);
         self.eval_combinational();
-        // Combinational `always @*` blocks must run before `#0` dumpvars; otherwise only
-        // `assign`-driven nets are in `driven` and always-driven signals are dumped as X.
-        // Fixed-point: multiple always blocks can depend on each other.
         for _ in 0..64 {
             self.prev_signals = self.signals.clone();
             let before = self.signals.clone();
@@ -873,80 +1194,166 @@ impl<'a> Simulator<'a> {
             }
         }
 
-        let vcd_step = |t_fs: u128| -> u128 {
-            if prec_fs == 0 {
-                t_fs
-            } else {
-                t_fs / prec_fs
-            }
-        };
-
-        self.write_timestamp(&mut vcd, vcd_step(0));
+        let step0 = self.vcd_step(0);
+        let mut vcd = std::mem::take(&mut self.vcd_buffer);
+        self.write_timestamp(&mut vcd, step0);
         writeln!(vcd, "$dumpvars").unwrap();
         self.write_all_values_initial(&mut vcd);
         writeln!(vcd, "$end").unwrap();
+        self.vcd_buffer = vcd;
 
-        let mut t_sim = 0u128;
+        self.t_sim = 0;
+        self.last_sim_time_fs = 0;
+        self.initialized = true;
+    }
+
+    /// VCD uses integer ticks at `precision` granularity; convert femtoseconds.
+    fn vcd_step(&self, t_fs: u128) -> u128 {
+        if self.prec_fs == 0 {
+            t_fs
+        } else {
+            t_fs / self.prec_fs
+        }
+    }
+
+    /// Drive one scheduler event: advance `t_sim`, fire delay processes +
+    /// always blocks, emit VCD changes. Returns how many statements fired during
+    /// the event (0 when there was no event to fire).
+    fn advance_one_event(&mut self) -> Option<usize> {
+        if self.finished {
+            return None;
+        }
+
+        let t_sim = self.t_sim;
+        let mut next_t = self.end_fs.saturating_add(1);
+        for e in &self.initial_events {
+            if e.time_fs > t_sim {
+                next_t = next_t.min(e.time_fs);
+            }
+        }
+        for p in &self.always_delay_procs {
+            if p.next_fire_fs > t_sim {
+                next_t = next_t.min(p.next_fire_fs);
+            }
+        }
+        if next_t > self.end_fs {
+            self.finished = true;
+            return None;
+        }
+
+        self.t_sim = next_t;
+        self.last_sim_time_fs = next_t;
+        let t_before_stmts = self.trace.len();
+
+        self.prev_signals = self.signals.clone();
+        self.apply_initial_events_at_fs(next_t);
+
+        let fired: Vec<(usize, StmtBlock, u128)> = self
+            .always_delay_procs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.next_fire_fs == next_t)
+            .map(|(i, p)| (i, p.stmts.clone(), p.period_fs))
+            .collect();
+        for (i, stmts, period_fs) in fired {
+            let mut nba = Vec::new();
+            self.exec_stmts(&stmts, &mut nba);
+            for (lhs, val) in nba {
+                let w = self.width_for_signal(&lhs);
+                self.signals.insert(lhs.clone(), mask_to_width(val, w));
+                self.driven.insert(lhs);
+            }
+            self.always_delay_procs[i].next_fire_fs = self.always_delay_procs[i]
+                .next_fire_fs
+                .saturating_add(period_fs);
+        }
+
+        self.eval_combinational();
+        self.fire_always_blocks(false);
+        self.eval_combinational();
+
+        let changes = self.collect_changes();
+        if !changes.is_empty() {
+            let step = self.vcd_step(next_t);
+            let mut vcd = std::mem::take(&mut self.vcd_buffer);
+            self.write_timestamp(&mut vcd, step);
+            for (name, val) in &changes {
+                self.write_signal_value(&mut vcd, name, *val);
+            }
+            self.vcd_buffer = vcd;
+        }
+
+        Some(self.trace.len() - t_before_stmts)
+    }
+
+    /// Run the event loop until the requested [`StepMode`] is satisfied.
+    ///
+    /// - [`StepMode::OneStatement`] runs scheduler events until at least one
+    ///   statement executes, then returns. Semantically "next observable
+    ///   statement fire" — blocks without statements (pure delay-only procs)
+    ///   are skipped over until a real statement runs.
+    /// - [`StepMode::OneTick`] runs exactly one scheduler event (`t_sim` bump).
+    /// - [`StepMode::OneCycle`] runs until `clock_signal` produces a `0 → 1`
+    ///   transition since entry. Falls back to `OneTick` when the signal is
+    ///   not found.
+    /// - [`StepMode::ToEnd`] drains the remaining events.
+    fn step_until(
+        &mut self,
+        mode: StepMode,
+        clock_signal: Option<&str>,
+    ) -> StepOutcome {
+        let mut ran_statements: usize = 0;
+        let clk_start = clock_signal.map(|s| *self.signals.get(s).unwrap_or(&0));
+
         loop {
-            let mut next_t = end_fs.saturating_add(1);
-            for e in &self.initial_events {
-                if e.time_fs > t_sim {
-                    next_t = next_t.min(e.time_fs);
+            match self.advance_one_event() {
+                None => {
+                    if ran_statements > 0 {
+                        return StepOutcome::Advanced {
+                            t_sim: self.t_sim.min(u64::MAX as u128) as u64,
+                            ran_statements,
+                        };
+                    }
+                    return StepOutcome::End;
                 }
-            }
-            for p in &self.always_delay_procs {
-                if p.next_fire_fs > t_sim {
-                    next_t = next_t.min(p.next_fire_fs);
-                }
-            }
-            if next_t > end_fs {
-                break;
-            }
-            t_sim = next_t;
-            self.last_sim_time_fs = t_sim;
-
-            self.prev_signals = self.signals.clone();
-
-            self.apply_initial_events_at_fs(t_sim);
-
-            let fired: Vec<(usize, Vec<IrStmt>, u128)> = self
-                .always_delay_procs
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.next_fire_fs == t_sim)
-                .map(|(i, p)| (i, p.stmts.clone(), p.period_fs))
-                .collect();
-            for (i, stmts, period_fs) in fired {
-                let mut nba = Vec::new();
-                self.exec_stmts(&stmts, &mut nba);
-                for (lhs, val) in nba {
-                    let w = self.width_for_signal(&lhs);
-                    self.signals.insert(lhs.clone(), mask_to_width(val, w));
-                    self.driven.insert(lhs);
-                }
-                self.always_delay_procs[i].next_fire_fs = self.always_delay_procs[i]
-                    .next_fire_fs
-                    .saturating_add(period_fs);
-            }
-
-            // `continuous assign` targets (e.g. hierarchical **Clock** = parent **CLK**) must settle
-            // before `posedge Clock` / `negedge` detection; otherwise sequential `always` never sees
-            // edges and the VCD only shows the generator clock.
-            self.eval_combinational();
-
-            self.fire_always_blocks(false);
-            self.eval_combinational();
-
-            let changes = self.collect_changes();
-            if !changes.is_empty() {
-                self.write_timestamp(&mut vcd, vcd_step(t_sim));
-                for (name, val) in &changes {
-                    self.write_signal_value(&mut vcd, name, *val);
+                Some(n) => {
+                    ran_statements = ran_statements.saturating_add(n);
+                    match mode {
+                        StepMode::OneStatement => {
+                            if n > 0 {
+                                return StepOutcome::Advanced {
+                                    t_sim: self.t_sim.min(u64::MAX as u128) as u64,
+                                    ran_statements,
+                                };
+                            }
+                        }
+                        StepMode::OneTick => {
+                            return StepOutcome::Advanced {
+                                t_sim: self.t_sim.min(u64::MAX as u128) as u64,
+                                ran_statements,
+                            };
+                        }
+                        StepMode::OneCycle => {
+                            if let (Some(sig), Some(start)) = (clock_signal, clk_start) {
+                                let cur = *self.signals.get(sig).unwrap_or(&0);
+                                if start == 0 && cur != 0 {
+                                    return StepOutcome::Advanced {
+                                        t_sim: self.t_sim.min(u64::MAX as u128) as u64,
+                                        ran_statements,
+                                    };
+                                }
+                            } else {
+                                return StepOutcome::Advanced {
+                                    t_sim: self.t_sim.min(u64::MAX as u128) as u64,
+                                    ran_statements,
+                                };
+                            }
+                        }
+                        StepMode::ToEnd => {}
+                    }
                 }
             }
         }
-
-        Ok(vcd)
     }
 
     fn apply_initial_events_at_fs(&mut self, t_fs: u128) {
@@ -968,9 +1375,25 @@ impl<'a> Simulator<'a> {
                 let w = self.width_for_signal(&assign.lhs);
                 let masked = mask_to_width(val, w);
                 let old = self.signals.get(&assign.lhs).copied().unwrap_or(0);
-                if masked != old {
+                // Record a driver event when the value visibly changes OR the
+                // first time we observe this assign driving its target. The
+                // "first time" case matters for Jump to Driver: otherwise a
+                // signal whose initial computed value equals the default (e.g.
+                // `assign Add = SW;` with SW=0) would never emit provenance
+                // and the debugger would report "no driver recorded" even
+                // though this `assign` is clearly the sole driver.
+                let first_time = !self.driven.contains(&assign.lhs);
+                if masked != old || first_time {
+                    // Driver trace: record provenance *before* mutation so the
+                    // recorded branch reflects the rhs we actually just
+                    // evaluated (re-evaluating inside `record_driver_event`
+                    // would see the new value when rhs reads back its own lhs).
+                    let branch = self.top_branch_for_rhs(&assign.rhs, &self.signals);
+                    self.record_driver_event(&assign.lhs, assign.span, branch, masked);
                     self.signals.insert(assign.lhs.clone(), masked);
-                    changed = true;
+                    if masked != old {
+                        changed = true;
+                    }
                 }
                 // On first round, mark all assign targets as driven
                 // (even if value happens to be 0 == default).
@@ -1079,24 +1502,38 @@ impl<'a> Simulator<'a> {
         !edges.is_empty() && edges.iter().all(|e| matches!(e.edge, IrEdgeKind::Level))
     }
 
-    fn exec_stmts(&mut self, stmts: &[IrStmt], nba: &mut Vec<(String, i64)>) {
-        for stmt in stmts {
-            self.exec_stmt(stmt, nba);
+    /// Iterate a block in CST order, emitting a [`TraceEntry`] per statement.
+    fn exec_stmts(&mut self, stmts: &StmtBlock, nba: &mut Vec<(String, i64)>) {
+        for (stmt, span) in stmts.iter_with_spans() {
+            self.exec_stmt(stmt, span, nba);
         }
     }
 
-    fn exec_stmt(&mut self, stmt: &IrStmt, nba: &mut Vec<(String, i64)>) {
+    fn exec_stmt(&mut self, stmt: &IrStmt, span: Span, nba: &mut Vec<(String, i64)>) {
+        // Debugger trace: one record per statement fire. Cheap (12 bytes) and
+        // gives the editor overlay the (time, span) stream it needs to follow
+        // the waveform cursor. See [`crate::trace`].
+        self.trace.push(TraceEntry {
+            time_fs: self.last_sim_time_fs.min(u64::MAX as u128) as u64,
+            span,
+        });
         match stmt {
             IrStmt::BlockingAssign { lhs, rhs } => {
                 let val = self.eval_expr(rhs);
                 let w = self.width_for_signal(lhs);
-                self.signals.insert(lhs.clone(), mask_to_width(val, w));
+                let masked = mask_to_width(val, w);
+                let branch = self.top_branch_for_rhs(rhs, &self.signals);
+                self.record_driver_event(lhs, span, branch, masked);
+                self.signals.insert(lhs.clone(), masked);
                 self.driven.insert(lhs.clone());
             }
             IrStmt::NonBlockingAssign { lhs, rhs } => {
                 let val = self.eval_expr(rhs);
                 let w = self.width_for_signal(lhs);
-                nba.push((lhs.clone(), mask_to_width(val, w)));
+                let masked = mask_to_width(val, w);
+                let branch = self.top_branch_for_rhs(rhs, &self.signals);
+                self.record_driver_event(lhs, span, branch, masked);
+                nba.push((lhs.clone(), masked));
             }
             IrStmt::MemAssign {
                 stem,
@@ -1131,7 +1568,11 @@ impl<'a> Simulator<'a> {
                 let mut matched = false;
                 for arm in arms {
                     let arm_val = self.eval_expr(&arm.value);
-                    if val == arm_val {
+                    let hit = match arm.care_mask {
+                        Some(mask) => (val & mask) == (arm_val & mask),
+                        None => val == arm_val,
+                    };
+                    if hit {
                         self.exec_stmts(&arm.body, nba);
                         matched = true;
                         break;
@@ -1170,20 +1611,31 @@ impl<'a> Simulator<'a> {
     fn exec_stmt_on_env(
         &mut self,
         stmt: &IrStmt,
+        span: Span,
         scratch: &mut std::collections::HashMap<String, i64>,
         nba: &mut Vec<(String, i64)>,
     ) {
+        self.trace.push(TraceEntry {
+            time_fs: self.last_sim_time_fs.min(u64::MAX as u128) as u64,
+            span,
+        });
         match stmt {
             IrStmt::BlockingAssign { lhs, rhs } => {
                 let val = self.eval_expr_with_env(rhs, scratch);
                 let w = self.width_for_signal(lhs);
-                scratch.insert(lhs.clone(), mask_to_width(val, w));
+                let masked = mask_to_width(val, w);
+                let branch = self.top_branch_for_rhs(rhs, scratch);
+                self.record_driver_event(lhs, span, branch, masked);
+                scratch.insert(lhs.clone(), masked);
                 self.driven.insert(lhs.clone());
             }
             IrStmt::NonBlockingAssign { lhs, rhs } => {
                 let val = self.eval_expr_with_env(rhs, scratch);
                 let w = self.width_for_signal(lhs);
-                nba.push((lhs.clone(), mask_to_width(val, w)));
+                let masked = mask_to_width(val, w);
+                let branch = self.top_branch_for_rhs(rhs, scratch);
+                self.record_driver_event(lhs, span, branch, masked);
+                nba.push((lhs.clone(), masked));
             }
             IrStmt::MemAssign {
                 stem,
@@ -1218,7 +1670,11 @@ impl<'a> Simulator<'a> {
                 let mut matched = false;
                 for arm in arms {
                     let arm_val = self.eval_expr_with_env(&arm.value, scratch);
-                    if val == arm_val {
+                    let hit = match arm.care_mask {
+                        Some(mask) => (val & mask) == (arm_val & mask),
+                        None => val == arm_val,
+                    };
+                    if hit {
                         self.exec_stmts_on_env(&arm.body, scratch, nba);
                         matched = true;
                         break;
@@ -1254,12 +1710,12 @@ impl<'a> Simulator<'a> {
 
     fn exec_stmts_on_env(
         &mut self,
-        stmts: &[IrStmt],
+        stmts: &StmtBlock,
         scratch: &mut std::collections::HashMap<String, i64>,
         nba: &mut Vec<(String, i64)>,
     ) {
-        for stmt in stmts {
-            self.exec_stmt_on_env(stmt, scratch, nba);
+        for (stmt, span) in stmts.iter_with_spans() {
+            self.exec_stmt_on_env(stmt, span, scratch, nba);
         }
     }
 
@@ -1573,8 +2029,8 @@ impl<'a> Simulator<'a> {
     }
 }
 
-fn stmts_assign_to(stmts: &[IrStmt], name: &str) -> bool {
-    for s in stmts {
+fn stmts_assign_to(stmts: &StmtBlock, name: &str) -> bool {
+    for s in stmts.iter() {
         match s {
             IrStmt::NonBlockingAssign { lhs, .. } | IrStmt::BlockingAssign { lhs, .. } => {
                 if lhs == name {
@@ -1745,11 +2201,15 @@ fn prefix_ir_expr(expr: &IrExpr, prefix: &str) -> IrExpr {
     }
 }
 
-fn prefix_stmts(stmts: &[IrStmt], prefix: &str) -> Vec<IrStmt> {
+fn prefix_stmts(block: &StmtBlock, prefix: &str) -> StmtBlock {
     if prefix.is_empty() {
-        return stmts.to_vec();
+        return block.clone();
     }
-    stmts.iter().map(|s| prefix_stmt(s, prefix)).collect()
+    let mut out = StmtBlock::with_capacity(block.len());
+    for (s, sp) in block.iter_with_spans() {
+        out.push(prefix_stmt(s, prefix), sp);
+    }
+    out
 }
 
 fn prefix_stmt(stmt: &IrStmt, prefix: &str) -> IrStmt {
@@ -1786,6 +2246,7 @@ fn prefix_stmt(stmt: &IrStmt, prefix: &str) -> IrStmt {
                 .map(|a| IrCaseArm {
                     value: prefix_ir_expr(&a.value, prefix),
                     body: prefix_stmts(&a.body, prefix),
+                    care_mask: a.care_mask,
                 })
                 .collect(),
             default: prefix_stmts(default, prefix),
@@ -1818,6 +2279,7 @@ mod tests {
         IrProject {
             modules,
             diagnostics: vec![],
+            source_map: SourceMap::new(),
         }
     }
 
@@ -1854,13 +2316,13 @@ mod tests {
             nets: vec![],
             assigns: vec![IrAssign {
                 lhs: "y".into(),
-                rhs: IrExpr::Ident("a".into()),
-            }],
+                rhs: IrExpr::Ident("a".into()), span: Span::dummy() }],
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1929,7 +2391,7 @@ endmodule
             always_blocks: vec![
                 IrAlways {
                     sensitivity: IrSensitivity::Star,
-                    stmts: vec![
+                    stmts: StmtBlock::from(vec![
                         IrStmt::Delay(DelayRational::from_int(5)),
                         IrStmt::BlockingAssign {
                             lhs: "clk".into(),
@@ -1938,32 +2400,32 @@ endmodule
                                 operand: Box::new(IrExpr::Ident("clk".into())),
                             },
                         },
-                    ],
+                    ]),
                 },
                 IrAlways {
                     sensitivity: IrSensitivity::EdgeList(vec![IrSensEntry {
                         edge: IrEdgeKind::Posedge,
                         signal: "clk".into(),
                     }]),
-                    stmts: vec![IrStmt::IfElse {
+                    stmts: StmtBlock::from(vec![IrStmt::IfElse {
                         cond: IrExpr::Ident("rst".into()),
-                        then_body: vec![IrStmt::NonBlockingAssign {
+                        then_body: StmtBlock::from(vec![IrStmt::NonBlockingAssign {
                             lhs: "count".into(),
                             rhs: IrExpr::Const(0),
-                        }],
-                        else_body: vec![IrStmt::NonBlockingAssign {
+                        }]),
+                        else_body: StmtBlock::from(vec![IrStmt::NonBlockingAssign {
                             lhs: "count".into(),
                             rhs: IrExpr::Binary {
                                 op: IrBinOp::Add,
                                 left: Box::new(IrExpr::Ident("count".into())),
                                 right: Box::new(IrExpr::Const(1)),
                             },
-                        }],
-                    }],
+                        }]),
+                    }]),
                 },
             ],
             initial_blocks: vec![IrInitial {
-                stmts: vec![
+                stmts: StmtBlock::from(vec![
                     IrStmt::BlockingAssign {
                         lhs: "clk".into(),
                         rhs: IrExpr::Const(0),
@@ -1972,10 +2434,11 @@ endmodule
                         lhs: "rst".into(),
                         rhs: IrExpr::Const(0),
                     },
-                ],
+                ]),
             }],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
 
         let proj = make_project(vec![top]);
@@ -2017,13 +2480,13 @@ endmodule
             nets: vec![],
             assigns: vec![IrAssign {
                 lhs: "data".into(),
-                rhs: IrExpr::Const(0xAB),
-            }],
+                rhs: IrExpr::Const(0xAB), span: Span::dummy() }],
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2047,7 +2510,7 @@ endmodule
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![IrInitial {
-                stmts: vec![
+                stmts: StmtBlock::from(vec![
                     IrStmt::BlockingAssign {
                         lhs: "sel".into(),
                         rhs: IrExpr::Const(0),
@@ -2057,10 +2520,11 @@ endmodule
                         lhs: "sel".into(),
                         rhs: IrExpr::Const(1),
                     },
-                ],
+                ]),
             }],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2090,6 +2554,7 @@ endmodule
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2116,13 +2581,13 @@ endmodule
                 rhs: IrExpr::Unary {
                     op: IrUnaryOp::Not,
                     operand: Box::new(IrExpr::Ident("a".into())),
-                },
-            }],
+                }, span: Span::dummy() }],
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let top = IrModule {
             name: "top".into(),
@@ -2138,10 +2603,12 @@ endmodule
                     IrPortConn {
                         port_name: Some("a".into()),
                         expr: IrExpr::Ident("in1".into()),
+                        span: Span::dummy(),
                     },
                     IrPortConn {
                         port_name: Some("y".into()),
                         expr: IrExpr::Ident("out1".into()),
+                        span: Span::dummy(),
                     },
                 ],
             }],
@@ -2149,6 +2616,7 @@ endmodule
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top, child]);
         let config = SimConfig {
@@ -2176,6 +2644,7 @@ endmodule
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2201,6 +2670,7 @@ endmodule
             initial_blocks: vec![],
             mem_arrays: vec![],
             resolved_parameters: std::collections::HashMap::new(),
+            file_id: SYNTHETIC_FILE,
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2248,19 +2718,18 @@ endmodule
                 signals: vec![],
                 children: vec![],
             },
-            top: &IrModule {
-                name: "t".into(),
-                path: "t.v".into(),
-                ports: vec![],
-                nets: vec![],
-                assigns: vec![],
-                instances: vec![],
-                always_blocks: vec![],
-                initial_blocks: vec![],
-                mem_arrays: vec![],
-                resolved_parameters: std::collections::HashMap::new(),
-            },
             last_sim_time_fs: 0,
+            trace: Vec::new(),
+            driver_events: Vec::new(),
+            signal_idx: HashMap::new(),
+            static_drivers: HashMap::new(),
+            port_aliases: HashMap::new(),
+            vcd_buffer: String::new(),
+            t_sim: 0,
+            end_fs: 0,
+            prec_fs: 1,
+            initialized: false,
+            finished: false,
         };
         assert_eq!(
             sim.eval_expr(&IrExpr::Binary {

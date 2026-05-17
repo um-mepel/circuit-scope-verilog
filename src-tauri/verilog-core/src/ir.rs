@@ -4,10 +4,161 @@ use std::path::Path;
 use crate::delay_rational::DelayRational;
 use crate::lexer;
 use crate::parser::{
-    self, AssignTarget, BinaryOp, CstModule, CstModuleItem, CstStmt, EdgeKind, Expr, Sensitivity,
-    UnaryOp,
+    self, AssignTarget, BinaryOp, CstBlock, CstModule, CstModuleItem, CstStmt, EdgeKind, Expr,
+    Sensitivity, UnaryOp,
 };
+use crate::source_map::{FileId, Span, SourceMap, SYNTHETIC_FILE};
 use crate::{Diagnostic, Port, SourceFile};
+
+// ── Spanned block wrapper for IrStmt lists ─────────────────────────────
+//
+// Carries a parallel `Vec<Span>` alongside `Vec<IrStmt>` so the simulator can
+// emit trace entries that point back at the originating byte range, without
+// modifying every `IrStmt` variant's shape (and breaking every pattern match).
+//
+// Deref<Target=[IrStmt]> + IntoIterator let existing consumer code that does
+// `for s in &block` or `&block[0]` continue to work unchanged.
+
+#[derive(Debug, Clone, Default)]
+pub struct StmtBlock {
+    stmts: Vec<IrStmt>,
+    spans: Vec<Span>,
+}
+
+impl StmtBlock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            stmts: Vec::with_capacity(n),
+            spans: Vec::with_capacity(n),
+        }
+    }
+
+    pub fn push(&mut self, stmt: IrStmt, span: Span) {
+        self.stmts.push(stmt);
+        self.spans.push(span);
+    }
+
+    pub fn stmts(&self) -> &[IrStmt] {
+        &self.stmts
+    }
+
+    pub fn stmts_mut(&mut self) -> &mut Vec<IrStmt> {
+        &mut self.stmts
+    }
+
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
+    pub fn spans_mut(&mut self) -> &mut Vec<Span> {
+        &mut self.spans
+    }
+
+    pub fn span_of(&self, idx: usize) -> Span {
+        self.spans
+            .get(idx)
+            .copied()
+            .unwrap_or_else(Span::dummy)
+    }
+
+    pub fn len(&self) -> usize {
+        self.stmts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stmts.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, IrStmt> {
+        self.stmts.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, IrStmt> {
+        self.stmts.iter_mut()
+    }
+
+    pub fn iter_with_spans(&self) -> impl Iterator<Item = (&IrStmt, Span)> + '_ {
+        self.stmts.iter().zip(self.spans.iter().copied())
+    }
+
+    pub fn into_parts(self) -> (Vec<IrStmt>, Vec<Span>) {
+        (self.stmts, self.spans)
+    }
+
+    pub fn from_parts(stmts: Vec<IrStmt>, spans: Vec<Span>) -> Self {
+        debug_assert_eq!(stmts.len(), spans.len());
+        Self { stmts, spans }
+    }
+
+    /// Build a block from a plain stmt vector, filling in dummy spans. Useful for
+    /// call sites that synthesize statements (optimizer, prefix rewrites) and
+    /// don't have a meaningful source location.
+    pub fn with_dummy_spans(stmts: Vec<IrStmt>) -> Self {
+        let spans = vec![Span::dummy(); stmts.len()];
+        Self { stmts, spans }
+    }
+}
+
+impl std::ops::Deref for StmtBlock {
+    type Target = [IrStmt];
+    fn deref(&self) -> &[IrStmt] {
+        &self.stmts
+    }
+}
+
+impl std::ops::DerefMut for StmtBlock {
+    fn deref_mut(&mut self) -> &mut [IrStmt] {
+        &mut self.stmts
+    }
+}
+
+impl<'a> IntoIterator for &'a StmtBlock {
+    type Item = &'a IrStmt;
+    type IntoIter = std::slice::Iter<'a, IrStmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut StmtBlock {
+    type Item = &'a mut IrStmt;
+    type IntoIter = std::slice::IterMut<'a, IrStmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.iter_mut()
+    }
+}
+
+impl FromIterator<(IrStmt, Span)> for StmtBlock {
+    fn from_iter<I: IntoIterator<Item = (IrStmt, Span)>>(iter: I) -> Self {
+        let mut b = StmtBlock::new();
+        for (s, sp) in iter {
+            b.push(s, sp);
+        }
+        b
+    }
+}
+
+/// Accept bare [`IrStmt`] collections (used in tests and legacy call sites that
+/// don't track spans); every element gets a dummy span.
+impl FromIterator<IrStmt> for StmtBlock {
+    fn from_iter<I: IntoIterator<Item = IrStmt>>(iter: I) -> Self {
+        let mut b = StmtBlock::new();
+        for s in iter {
+            b.push(s, Span::dummy());
+        }
+        b
+    }
+}
+
+impl From<Vec<IrStmt>> for StmtBlock {
+    fn from(stmts: Vec<IrStmt>) -> Self {
+        StmtBlock::with_dummy_spans(stmts)
+    }
+}
 
 // ── IR expression tree ──────────────────────────────────────────────
 
@@ -200,16 +351,22 @@ pub(crate) fn ir_net_width_in_module(m: &IrModule, name: &str) -> usize {
 
 // ── IR project / module structures ──────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IrProject {
     pub modules: Vec<IrModule>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Registry of source files + precomputed line starts; keyed by [`FileId`].
+    /// Populated by `build_ir_for_*` so debugger/trace consumers can resolve spans.
+    pub source_map: SourceMap,
 }
 
 #[derive(Debug, Clone)]
 pub struct IrModule {
     pub name: String,
     pub path: String,
+    /// Registered file-id for [`IrModule::path`] in the owning [`IrProject::source_map`].
+    /// `SYNTHETIC_FILE` for modules synthesized after elaboration without a concrete file.
+    pub file_id: FileId,
     pub ports: Vec<Port>,
     pub nets: Vec<IrNet>,
     pub assigns: Vec<IrAssign>,
@@ -220,6 +377,24 @@ pub struct IrModule {
     pub mem_arrays: Vec<IrMemArray>,
     /// Resolved `parameter` / `localparam` values for this module (used to evaluate child `#(.param(expr))`).
     pub resolved_parameters: HashMap<String, i64>,
+}
+
+impl Default for IrModule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            path: String::new(),
+            file_id: SYNTHETIC_FILE,
+            ports: Vec::new(),
+            nets: Vec::new(),
+            assigns: Vec::new(),
+            instances: Vec::new(),
+            always_blocks: Vec::new(),
+            initial_blocks: Vec::new(),
+            mem_arrays: Vec::new(),
+            resolved_parameters: HashMap::new(),
+        }
+    }
 }
 
 /// Metadata for unpacked arrays declared as `reg [w-1:0] stem[hi:lo];`.
@@ -237,15 +412,29 @@ pub struct IrNet {
     pub width: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IrInitial {
-    pub stmts: Vec<IrStmt>,
+    pub stmts: StmtBlock,
 }
 
 #[derive(Debug, Clone)]
 pub struct IrAssign {
     pub lhs: String,
     pub rhs: IrExpr,
+    /// Byte span of the originating `assign … ;` statement in the owning
+    /// [`IrModule`]'s source file. [`Span::dummy`] when synthesized (e.g. by
+    /// the optimizer) or lowered without source information.
+    pub span: Span,
+}
+
+impl Default for IrAssign {
+    fn default() -> Self {
+        Self {
+            lhs: String::new(),
+            rhs: IrExpr::Const(0),
+            span: Span::dummy(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +451,13 @@ pub struct IrInstance {
 pub struct IrPortConn {
     pub port_name: Option<String>,
     pub expr: IrExpr,
+    /// Source span of the `.port(expr)` connection in the instantiating
+    /// module (or the bare `expr` for positional connections). Used by
+    /// `flatten_module` to attach a real source location to the glue
+    /// `assign` it synthesizes for instance-port drives — without this,
+    /// "Jump to Driver" on a submodule-input port has no span to resolve.
+    /// `Span::dummy()` when unknown (synthesized at elaboration time).
+    pub span: Span,
 }
 
 // ── Sequential / procedural IR ─────────────────────────────────────
@@ -288,7 +484,7 @@ pub enum IrSensitivity {
 #[derive(Debug, Clone)]
 pub struct IrAlways {
     pub sensitivity: IrSensitivity,
-    pub stmts: Vec<IrStmt>,
+    pub stmts: StmtBlock,
 }
 
 #[derive(Debug, Clone)]
@@ -304,13 +500,13 @@ pub enum IrStmt {
     },
     IfElse {
         cond: IrExpr,
-        then_body: Vec<IrStmt>,
-        else_body: Vec<IrStmt>,
+        then_body: StmtBlock,
+        else_body: StmtBlock,
     },
     Case {
         expr: IrExpr,
         arms: Vec<IrCaseArm>,
-        default: Vec<IrStmt>,
+        default: StmtBlock,
     },
     For {
         init_var: String,
@@ -318,7 +514,7 @@ pub enum IrStmt {
         cond: IrExpr,
         step_var: String,
         step_expr: IrExpr,
-        body: Vec<IrStmt>,
+        body: StmtBlock,
     },
     Delay(DelayRational),
     SystemTask {
@@ -330,24 +526,33 @@ pub enum IrStmt {
 #[derive(Debug, Clone)]
 pub struct IrCaseArm {
     pub value: IrExpr,
-    pub body: Vec<IrStmt>,
+    pub body: StmtBlock,
+    /// When `Some(mask)`, the case-arm match is `(scrutinee & mask) ==
+    /// (value & mask)` (used by `casez` / `casex` for `?` / `z` / `x`
+    /// wildcards in the literal). `None` means exact-equality, the legacy
+    /// `case` semantics.
+    pub care_mask: Option<i64>,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
 
 pub fn build_ir_for_file(path: impl Into<String>, content: &str) -> IrProject {
-    let file = SourceFile::new(path, content);
+    let path: String = path.into();
+    let file = SourceFile::new(path.clone(), content);
     let tokens = lexer::lex(&file);
     let (cst, diagnostics) = parser::parse_cst(&file, &tokens);
+    let mut source_map = SourceMap::new();
+    let file_id = source_map.intern(&path, content);
     let mut cst_map: HashMap<String, CstModule> = HashMap::new();
     let mut modules = Vec::new();
     for m in cst.modules {
         cst_map.insert(m.name.clone(), m.clone());
-        modules.push(ir_module_from_cst(m));
+        modules.push(ir_module_from_cst(m, file_id));
     }
     let mut project = IrProject {
         modules,
         diagnostics,
+        source_map,
     };
     elaborate_parameterized_modules(&mut project, &cst_map);
     project
@@ -359,20 +564,24 @@ pub fn build_ir_for_path_bufs(paths: &[std::path::PathBuf]) -> std::io::Result<I
     let mut all_modules = Vec::new();
     let mut all_diags = Vec::new();
     let mut cst_map: HashMap<String, CstModule> = HashMap::new();
+    let mut source_map = SourceMap::new();
     for path in paths {
         let src = std::fs::read_to_string(path)?;
-        let file = SourceFile::new(path.to_string_lossy(), &src);
+        let path_s = path.to_string_lossy().into_owned();
+        let file = SourceFile::new(&path_s, &src);
         let tokens = lexer::lex(&file);
         let (cst, mut diags) = parser::parse_cst(&file, &tokens);
         all_diags.append(&mut diags);
+        let file_id = source_map.intern(&path_s, &src);
         for m in cst.modules {
             cst_map.insert(m.name.clone(), m.clone());
-            all_modules.push(ir_module_from_cst(m));
+            all_modules.push(ir_module_from_cst(m, file_id));
         }
     }
     let mut project = IrProject {
         modules: all_modules,
         diagnostics: all_diags,
+        source_map,
     };
     elaborate_parameterized_modules(&mut project, &cst_map);
     Ok(project)
@@ -382,21 +591,25 @@ pub fn build_ir_for_root(root: &Path) -> std::io::Result<IrProject> {
     let mut all_modules = Vec::new();
     let mut all_diags = Vec::new();
     let mut cst_map: HashMap<String, CstModule> = HashMap::new();
+    let mut source_map = SourceMap::new();
     walk_dir(root, &mut |path| {
         if let Ok(src) = std::fs::read_to_string(path) {
-            let file = SourceFile::new(path.to_string_lossy(), &src);
+            let path_s = path.to_string_lossy().into_owned();
+            let file = SourceFile::new(&path_s, &src);
             let tokens = lexer::lex(&file);
             let (cst, mut diags) = parser::parse_cst(&file, &tokens);
             all_diags.append(&mut diags);
+            let file_id = source_map.intern(&path_s, &src);
             for m in cst.modules {
                 cst_map.insert(m.name.clone(), m.clone());
-                all_modules.push(ir_module_from_cst(m));
+                all_modules.push(ir_module_from_cst(m, file_id));
             }
         }
     })?;
     let mut project = IrProject {
         modules: all_modules,
         diagnostics: all_diags,
+        source_map,
     };
     elaborate_parameterized_modules(&mut project, &cst_map);
     Ok(project)
@@ -543,6 +756,7 @@ pub fn elaborate_parameterized_modules(
     let mut cache: HashMap<(String, Vec<(String, i64)>), String> = HashMap::new();
     for mi in 0..initial_len {
         let parent_params = project.modules[mi].resolved_parameters.clone();
+        let parent_file_id = project.modules[mi].file_id;
         let instances = std::mem::take(&mut project.modules[mi].instances);
         let mut new_insts = Vec::with_capacity(instances.len());
         for mut inst in instances {
@@ -587,7 +801,7 @@ pub fn elaborate_parameterized_modules(
                 }
                 let spec_name = specialized_module_name(&base, &pairs);
                 specialized.name = spec_name.clone();
-                let ir_mod = ir_module_from_cst(specialized);
+                let ir_mod = ir_module_from_cst(specialized, parent_file_id);
                 cache.insert(cache_key, spec_name.clone());
                 project.modules.push(ir_mod);
                 spec_name
@@ -731,7 +945,7 @@ fn merge_port_directions_from_body(items: &[CstModuleItem], ports: &mut [Port]) 
     }
 }
 
-fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
+fn ir_module_from_cst(mut cst: CstModule, file_id: FileId) -> IrModule {
     merge_port_directions_from_body(&cst.items, &mut cst.ports);
     let mut param_pairs = cst.module_parameters.clone();
     param_pairs.extend(collect_local_param_assignments(&cst.items));
@@ -746,10 +960,16 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
     let mut initial_blocks = Vec::new();
     for item in cst.items {
         match item {
-            CstModuleItem::Assign { target, expr } => {
-                if let Some(a) =
-                    lower_continuous_assign(target, expr, &mem_stems, &locals, &net_widths)
-                {
+            CstModuleItem::Assign { target, expr, range } => {
+                if let Some(a) = lower_continuous_assign(
+                    target,
+                    expr,
+                    &mem_stems,
+                    &locals,
+                    &net_widths,
+                    file_id,
+                    range,
+                ) {
                     assigns.push(a);
                 }
             }
@@ -804,6 +1024,11 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
                     .into_iter()
                     .map(|c| IrPortConn {
                         port_name: c.port_name,
+                        span: if c.range.1 > c.range.0 {
+                            Span::new(file_id, c.range.0, c.range.1)
+                        } else {
+                            Span::dummy()
+                        },
                         expr: lower_expr(c.expr, &mem_stems, &locals),
                     })
                     .collect();
@@ -838,6 +1063,11 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
                         .into_iter()
                         .map(|c| IrPortConn {
                             port_name: c.port_name,
+                            span: if c.range.1 > c.range.0 {
+                                Span::new(file_id, c.range.0, c.range.1)
+                            } else {
+                                Span::dummy()
+                            },
                             expr: lower_expr(c.expr, &mem_stems, &locals),
                         })
                         .collect();
@@ -849,6 +1079,47 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
                     });
                 }
             }
+            CstModuleItem::GenerateForAssigns {
+                loop_var,
+                upper_expr,
+                assigns: body_assigns,
+            } => {
+                use crate::expr_const::const_eval_param_expr;
+                use crate::parser::{subst_expr_loop_var, subst_target_loop_var};
+                let n = const_eval_param_expr(&upper_expr, &locals)
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                for k in 0..n {
+                    for (target, expr, range) in body_assigns.iter().cloned() {
+                        let target_k = subst_target_loop_var(target, &loop_var, k as i64);
+                        let expr_k = subst_expr_loop_var(expr, &loop_var, k as i64);
+                        if let Some(a) = lower_continuous_assign(
+                            target_k,
+                            expr_k,
+                            &mem_stems,
+                            &locals,
+                            &net_widths,
+                            file_id,
+                            range,
+                        ) {
+                            assigns.push(a);
+                        }
+                    }
+                }
+            }
+            CstModuleItem::GenerateForBody { .. }
+            | CstModuleItem::GenerateIf { .. }
+            | CstModuleItem::GenerateCase { .. } => {
+                elaborate_generate_item(
+                    item,
+                    &mem_stems,
+                    &locals,
+                    &net_widths,
+                    file_id,
+                    &mut assigns,
+                    &mut instances,
+                );
+            }
             CstModuleItem::Always { sensitivity, body } => {
                 always_blocks.push(lower_always(
                     sensitivity,
@@ -856,14 +1127,12 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
                     &mem_stems,
                     &locals,
                     &net_widths,
+                    file_id,
                 ));
             }
             CstModuleItem::Initial { body } => {
                 initial_blocks.push(IrInitial {
-                    stmts: body
-                        .into_iter()
-                        .filter_map(|s| lower_stmt(s, &mem_stems, &locals, &net_widths))
-                        .collect(),
+                    stmts: lower_stmt_block(body, &mem_stems, &locals, &net_widths, file_id),
                 });
             }
             CstModuleItem::LocalParam { .. } => {}
@@ -872,6 +1141,7 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
     IrModule {
         name: cst.name,
         path: cst.path,
+        file_id,
         ports: cst.ports,
         nets,
         assigns,
@@ -885,10 +1155,11 @@ fn ir_module_from_cst(mut cst: CstModule) -> IrModule {
 
 fn lower_always(
     sens: Sensitivity,
-    stmts: Vec<CstStmt>,
+    body: CstBlock,
     mem_stems: &HashSet<String>,
     locals: &HashMap<String, i64>,
     net_widths: &HashMap<String, usize>,
+    file_id: FileId,
 ) -> IrAlways {
     let sensitivity = match sens {
         Sensitivity::Star => IrSensitivity::Star,
@@ -908,11 +1179,47 @@ fn lower_always(
     };
     IrAlways {
         sensitivity,
-        stmts: stmts
-            .into_iter()
-            .filter_map(|s| lower_stmt(s, mem_stems, locals, net_widths))
-            .collect(),
+        stmts: lower_stmt_block(body, mem_stems, locals, net_widths, file_id),
     }
+}
+
+/// Lower a [`CstBlock`] into a [`StmtBlock`] with spans, filtering out statements
+/// that fail to lower (e.g. unsupported syntax).
+fn lower_stmt_block(
+    body: CstBlock,
+    mem_stems: &HashSet<String>,
+    locals: &HashMap<String, i64>,
+    net_widths: &HashMap<String, usize>,
+    file_id: FileId,
+) -> StmtBlock {
+    let (stmts, ranges) = body.into_parts();
+    let mut out = StmtBlock::with_capacity(stmts.len());
+    for (s, (start, end)) in stmts.into_iter().zip(ranges.into_iter()) {
+        let span = Span::new(file_id, start, end);
+        // Concat-LHS (`{a, b, c} = rhs;`) lowers to multiple per-component
+        // assignments; expand inline so each lands as its own statement
+        // sharing the source span of the original concat.
+        let concat_kind = match &s {
+            CstStmt::BlockingAssign { target: AssignTarget::Concat(_), .. } => Some(false),
+            CstStmt::NonBlockingAssign { target: AssignTarget::Concat(_), .. } => Some(true),
+            _ => None,
+        };
+        if let Some(is_nb) = concat_kind {
+            let (target, rhs) = match s {
+                CstStmt::BlockingAssign { target, rhs } => (target, rhs),
+                CstStmt::NonBlockingAssign { target, rhs } => (target, rhs),
+                _ => unreachable!(),
+            };
+            for ir in lower_concat_assign_stmts(target, rhs, is_nb, mem_stems, locals, net_widths) {
+                out.push(ir, span);
+            }
+            continue;
+        }
+        if let Some(ir) = lower_stmt(s, mem_stems, locals, net_widths, file_id) {
+            out.push(ir, span);
+        }
+    }
+    out
 }
 
 fn net_width_or_default(net_widths: &HashMap<String, usize>, reg: &str) -> usize {
@@ -1026,10 +1333,13 @@ fn lower_continuous_assign(
     mem_stems: &HashSet<String>,
     locals: &HashMap<String, i64>,
     net_widths: &HashMap<String, usize>,
+    file_id: FileId,
+    range: (u32, u32),
 ) -> Option<IrAssign> {
     let stmt = lower_assign_from_target(target, rhs, false, mem_stems, locals, net_widths)?;
+    let span = Span::new(file_id, range.0, range.1);
     match stmt {
-        IrStmt::BlockingAssign { lhs, rhs } => Some(IrAssign { lhs, rhs }),
+        IrStmt::BlockingAssign { lhs, rhs } => Some(IrAssign { lhs, rhs, span }),
         IrStmt::NonBlockingAssign { .. } => None,
         _ => None,
     }
@@ -1043,6 +1353,12 @@ fn lower_assign_from_target(
     locals: &HashMap<String, i64>,
     net_widths: &HashMap<String, usize>,
 ) -> Option<IrStmt> {
+    // Concat-LHS is multi-statement; `lower_stmt_block` intercepts it first.
+    // Continuous-assign callers that hit this path silently drop the
+    // statement, which matches the prior behaviour for unsupported forms.
+    if matches!(target, AssignTarget::Concat(_)) {
+        return None;
+    }
     fn wrap_nb(stmt: IrStmt, is_nb: bool) -> IrStmt {
         if is_nb {
             if let IrStmt::BlockingAssign { lhs, rhs } = stmt {
@@ -1104,7 +1420,296 @@ fn lower_assign_from_target(
             };
             wrap_nb(stmt, is_nb)
         }
+        // Guarded by the early-return at the top of this function.
+        AssignTarget::Concat(_) => unreachable!("concat-LHS is handled in lower_stmt_block"),
     })
+}
+
+/// Elaborate a generate-body item (GenerateForBody / GenerateIf / GenerateCase)
+/// or any normal item that may appear in such a body. Recurses through nested
+/// generate constructs. Loop variables are substituted at each iteration with
+/// [`subst_module_item_loop_var`].
+fn elaborate_generate_item(
+    item: CstModuleItem,
+    mem_stems: &HashSet<String>,
+    locals: &HashMap<String, i64>,
+    net_widths: &HashMap<String, usize>,
+    file_id: FileId,
+    assigns: &mut Vec<IrAssign>,
+    instances: &mut Vec<IrInstance>,
+) {
+    use crate::expr_const::const_eval_param_expr;
+    use crate::parser::{
+        subst_expr_loop_var, subst_module_item_loop_var, subst_port_connections,
+        subst_target_loop_var,
+    };
+    match item {
+        CstModuleItem::Assign { target, expr, range } => {
+            if let Some(a) = lower_continuous_assign(
+                target, expr, mem_stems, locals, net_widths, file_id, range,
+            ) {
+                assigns.push(a);
+            }
+        }
+        CstModuleItem::Instance {
+            module_name,
+            parameter_assignments,
+            instance_name,
+            connections,
+        } => {
+            let param_ir: Vec<(String, IrExpr)> = parameter_assignments
+                .into_iter()
+                .map(|(n, e)| (n, lower_expr(e, mem_stems, locals)))
+                .collect();
+            let conns = connections
+                .into_iter()
+                .map(|c| IrPortConn {
+                    port_name: c.port_name,
+                    span: if c.range.1 > c.range.0 {
+                        Span::new(file_id, c.range.0, c.range.1)
+                    } else {
+                        Span::dummy()
+                    },
+                    expr: lower_expr(c.expr, mem_stems, locals),
+                })
+                .collect();
+            instances.push(IrInstance {
+                module_name,
+                parameter_assignments: param_ir,
+                instance_name,
+                connections: conns,
+            });
+        }
+        CstModuleItem::GenerateFor {
+            loop_var,
+            upper_expr,
+            module_name,
+            parameter_assignments,
+            instance_stem,
+            connections,
+        } => {
+            let n = const_eval_param_expr(&upper_expr, locals)
+                .unwrap_or(0)
+                .max(0) as usize;
+            for k in 0..n {
+                let conns = subst_port_connections(&connections, &loop_var, k as i64);
+                let param_ir: Vec<(String, IrExpr)> = parameter_assignments
+                    .iter()
+                    .cloned()
+                    .map(|(n, e)| (n, lower_expr(e, mem_stems, locals)))
+                    .collect();
+                let conns_ir = conns
+                    .into_iter()
+                    .map(|c| IrPortConn {
+                        port_name: c.port_name,
+                        span: if c.range.1 > c.range.0 {
+                            Span::new(file_id, c.range.0, c.range.1)
+                        } else {
+                            Span::dummy()
+                        },
+                        expr: lower_expr(c.expr, mem_stems, locals),
+                    })
+                    .collect();
+                instances.push(IrInstance {
+                    module_name: module_name.clone(),
+                    parameter_assignments: param_ir,
+                    instance_name: format!("{}__{}", instance_stem, k),
+                    connections: conns_ir,
+                });
+            }
+        }
+        CstModuleItem::GenerateForAssigns {
+            loop_var,
+            upper_expr,
+            assigns: body_assigns,
+        } => {
+            let n = const_eval_param_expr(&upper_expr, locals)
+                .unwrap_or(0)
+                .max(0) as usize;
+            for k in 0..n {
+                for (target, expr, range) in body_assigns.iter().cloned() {
+                    let target_k = subst_target_loop_var(target, &loop_var, k as i64);
+                    let expr_k = subst_expr_loop_var(expr, &loop_var, k as i64);
+                    if let Some(a) = lower_continuous_assign(
+                        target_k, expr_k, mem_stems, locals, net_widths, file_id, range,
+                    ) {
+                        assigns.push(a);
+                    }
+                }
+            }
+        }
+        CstModuleItem::GenerateForBody { loop_var, upper_expr, body } => {
+            let n = const_eval_param_expr(&upper_expr, locals)
+                .unwrap_or(0)
+                .max(0) as usize;
+            for k in 0..n {
+                for inner in body.iter().cloned() {
+                    let substituted = subst_module_item_loop_var(inner, &loop_var, k as i64);
+                    elaborate_generate_item(
+                        substituted,
+                        mem_stems,
+                        locals,
+                        net_widths,
+                        file_id,
+                        assigns,
+                        instances,
+                    );
+                }
+            }
+        }
+        CstModuleItem::GenerateIf { cond, then_body, else_body } => {
+            let c = const_eval_param_expr(&cond, locals).unwrap_or(0);
+            let chosen = if c != 0 { then_body } else { else_body };
+            for inner in chosen {
+                elaborate_generate_item(
+                    inner, mem_stems, locals, net_widths, file_id, assigns, instances,
+                );
+            }
+        }
+        CstModuleItem::GenerateCase { scrutinee, arms, default } => {
+            let s = const_eval_param_expr(&scrutinee, locals).unwrap_or(0);
+            let mut matched: Option<Vec<CstModuleItem>> = None;
+            for (val, body) in arms {
+                let v = const_eval_param_expr(&val, locals).unwrap_or(0);
+                if v == s {
+                    matched = Some(body);
+                    break;
+                }
+            }
+            let chosen = matched.unwrap_or(default);
+            for inner in chosen {
+                elaborate_generate_item(
+                    inner, mem_stems, locals, net_widths, file_id, assigns, instances,
+                );
+            }
+        }
+        // Other module items (NetDecl, Always, Initial, LocalParam) are not
+        // expected inside generate bodies in the test corpus. They could be
+        // supported by extending this helper if needed.
+        _ => {}
+    }
+}
+
+/// Width of an LHS component (in bits) used when splitting a concat-LHS into
+/// per-component assignments. Non-const part-selects fall back to 1 — they're
+/// already a degenerate case for the simulator and lowering rejects them
+/// downstream when the bit pattern can't be materialised.
+fn concat_component_width(
+    t: &AssignTarget,
+    locals: &HashMap<String, i64>,
+    net_widths: &HashMap<String, usize>,
+) -> usize {
+    match t {
+        AssignTarget::Whole(name) => net_widths.get(name).copied().unwrap_or(1),
+        AssignTarget::BitSelect { .. } => 1,
+        AssignTarget::PartSelect { msb, lsb, .. } => {
+            let m = crate::expr_const::const_eval_param_expr(msb, locals).unwrap_or(0);
+            let l = crate::expr_const::const_eval_param_expr(lsb, locals).unwrap_or(0);
+            ((m - l).unsigned_abs() as usize) + 1
+        }
+        AssignTarget::Concat(parts) => parts
+            .iter()
+            .map(|p| concat_component_width(p, locals, net_widths))
+            .sum(),
+    }
+}
+
+/// Lower a concat-LHS assignment `{a, b, c} = rhs` into a sequence of
+/// per-component blocking (or non-blocking) assignments. Components are
+/// MSB-first in source, so the leftmost element receives the high bits.
+fn lower_concat_assign_stmts(
+    target: AssignTarget,
+    rhs: Expr,
+    is_nb: bool,
+    mem_stems: &HashSet<String>,
+    locals: &HashMap<String, i64>,
+    net_widths: &HashMap<String, usize>,
+) -> Vec<IrStmt> {
+    let comps = match target {
+        AssignTarget::Concat(c) => c,
+        _ => return vec![],
+    };
+    let rhs_ir = lower_expr(rhs, mem_stems, locals);
+    expand_concat_with_rhs_ir(comps, rhs_ir, is_nb, mem_stems, locals, net_widths)
+}
+
+fn expand_concat_with_rhs_ir(
+    comps: Vec<AssignTarget>,
+    rhs_ir: IrExpr,
+    is_nb: bool,
+    mem_stems: &HashSet<String>,
+    locals: &HashMap<String, i64>,
+    net_widths: &HashMap<String, usize>,
+) -> Vec<IrStmt> {
+    fn wrap_nb(stmt: IrStmt, is_nb: bool) -> IrStmt {
+        if is_nb {
+            if let IrStmt::BlockingAssign { lhs, rhs } = stmt {
+                return IrStmt::NonBlockingAssign { lhs, rhs };
+            }
+        }
+        stmt
+    }
+    let widths: Vec<usize> = comps
+        .iter()
+        .map(|c| concat_component_width(c, locals, net_widths))
+        .collect();
+    let total: usize = widths.iter().sum();
+    let mut out = Vec::new();
+    let mut shift = total;
+    for (comp, w) in comps.into_iter().zip(widths.into_iter()) {
+        // First component (MSB) gets the high slice; track shift downward.
+        shift = shift.saturating_sub(w);
+        let mask: i64 = if w >= 63 { !0 } else { (1i64 << w) - 1 };
+        let shifted = if shift == 0 {
+            rhs_ir.clone()
+        } else {
+            IrExpr::Binary {
+                op: IrBinOp::Shr,
+                left: Box::new(rhs_ir.clone()),
+                right: Box::new(IrExpr::Const(shift as i64)),
+            }
+        };
+        let masked = IrExpr::Binary {
+            op: IrBinOp::And,
+            left: Box::new(shifted),
+            right: Box::new(IrExpr::Const(mask)),
+        };
+        match comp {
+            AssignTarget::Concat(inner) => {
+                out.extend(expand_concat_with_rhs_ir(
+                    inner, masked, is_nb, mem_stems, locals, net_widths,
+                ));
+            }
+            AssignTarget::Whole(name) => {
+                let stmt = IrStmt::BlockingAssign {
+                    lhs: name,
+                    rhs: masked,
+                };
+                out.push(wrap_nb(stmt, is_nb));
+            }
+            AssignTarget::BitSelect { reg, index } => {
+                let idx_ir = lower_expr(index, mem_stems, locals);
+                let w_outer = net_width_or_default(net_widths, &reg);
+                let stmt = lower_packed_bit_assign(reg, idx_ir, masked, w_outer);
+                out.push(wrap_nb(stmt, is_nb));
+            }
+            AssignTarget::PartSelect { reg, msb, lsb } => {
+                let msb_ir = lower_expr(msb, mem_stems, locals);
+                let lsb_ir = lower_expr(lsb, mem_stems, locals);
+                let w_outer = net_width_or_default(net_widths, &reg);
+                let stmt = if let (IrExpr::Const(a), IrExpr::Const(b)) = (&msb_ir, &lsb_ir) {
+                    lower_packed_part_assign_const(reg, *a, *b, masked, w_outer)
+                } else {
+                    IrStmt::BlockingAssign {
+                        lhs: reg,
+                        rhs: masked,
+                    }
+                };
+                out.push(wrap_nb(stmt, is_nb));
+            }
+        }
+    }
+    out
 }
 
 fn lower_stmt(
@@ -1112,6 +1717,7 @@ fn lower_stmt(
     mem_stems: &HashSet<String>,
     locals: &HashMap<String, i64>,
     net_widths: &HashMap<String, usize>,
+    file_id: FileId,
 ) -> Option<IrStmt> {
     match s {
         CstStmt::BlockingAssign { target, rhs } => {
@@ -1126,16 +1732,11 @@ fn lower_stmt(
             else_body,
         } => Some(IrStmt::IfElse {
             cond: lower_expr(cond, mem_stems, locals),
-            then_body: then_body
-                .into_iter()
-                .filter_map(|s| lower_stmt(s, mem_stems, locals, net_widths))
-                .collect(),
-            else_body: else_body
-                .into_iter()
-                .filter_map(|s| lower_stmt(s, mem_stems, locals, net_widths))
-                .collect(),
+            then_body: lower_stmt_block(then_body, mem_stems, locals, net_widths, file_id),
+            else_body: lower_stmt_block(else_body, mem_stems, locals, net_widths, file_id),
         }),
         CstStmt::Case {
+            kind,
             expr,
             arms,
             default,
@@ -1143,19 +1744,20 @@ fn lower_stmt(
             expr: lower_expr(expr, mem_stems, locals),
             arms: arms
                 .into_iter()
-                .map(|a| IrCaseArm {
-                    value: lower_expr(a.value, mem_stems, locals),
-                    body: a
-                        .body
-                        .into_iter()
-                        .filter_map(|s| lower_stmt(s, mem_stems, locals, net_widths))
-                        .collect(),
+                .map(|a| {
+                    let care_mask = if kind == crate::parser::CaseKind::Plain {
+                        None
+                    } else {
+                        wildcard_mask_from_expr(&a.value)
+                    };
+                    IrCaseArm {
+                        value: lower_expr(a.value, mem_stems, locals),
+                        body: lower_stmt_block(a.body, mem_stems, locals, net_widths, file_id),
+                        care_mask,
+                    }
                 })
                 .collect(),
-            default: default
-                .into_iter()
-                .filter_map(|s| lower_stmt(s, mem_stems, locals, net_widths))
-                .collect(),
+            default: lower_stmt_block(default, mem_stems, locals, net_widths, file_id),
         }),
         CstStmt::For {
             init_var,
@@ -1170,10 +1772,7 @@ fn lower_stmt(
             cond: lower_expr(cond, mem_stems, locals),
             step_var,
             step_expr: lower_expr(step_expr, mem_stems, locals),
-            body: body
-                .into_iter()
-                .filter_map(|s| lower_stmt(s, mem_stems, locals, net_widths))
-                .collect(),
+            body: lower_stmt_block(body, mem_stems, locals, net_widths, file_id),
         }),
         CstStmt::Delay(d) => Some(IrStmt::Delay(d)),
         CstStmt::SystemTask { name, args } => Some(IrStmt::SystemTask {
@@ -1517,4 +2116,81 @@ mod ir_try_eval_const_index_tests {
         };
         assert_eq!(ir_try_eval_const_index_expr(&e), Some(8));
     }
+}
+
+
+/// Parse a literal source string like `8'b1???_????` or `4'hF?` and return
+/// `(value, mask)` where `mask` has 1s only in bit positions whose value is
+/// known (not `?`/`x`/`z`). Returns `None` if the expression isn't a
+/// recognizable sized/unsized binary or hex literal — caller falls back to
+/// exact-equality matching.
+fn wildcard_mask_from_expr(e: &crate::parser::Expr) -> Option<i64> {
+    let s = match e {
+        crate::parser::Expr::Number(n) => n.as_str(),
+        _ => return None,
+    };
+    let apos = s.find('\'')?;
+    let rest = &s[apos + 1..];
+    let base = rest.chars().next()?;
+    let digits = &rest[1..];
+    let (_value, mask) = match base {
+        'b' | 'B' => parse_binary_literal_with_mask(digits)?,
+        'h' | 'H' => parse_hex_literal_with_mask(digits)?,
+        _ => return None,
+    };
+    // Only flag wildcards when the mask actually has 0s in care positions.
+    // For a plain `8'b1010` mask=0xFF — equivalent to exact-equality, so we
+    // can return None and skip the masking overhead.
+    let nbits = (mask.checked_ilog2().unwrap_or(0) + 1) as usize;
+    let full_mask: i64 = if nbits >= 63 { !0 } else { (1i64 << nbits) - 1 };
+    if mask == full_mask {
+        None
+    } else {
+        Some(mask)
+    }
+}
+
+fn parse_binary_literal_with_mask(digits: &str) -> Option<(i64, i64)> {
+    let mut value: i64 = 0;
+    let mut mask: i64 = 0;
+    for c in digits.chars() {
+        if c == '_' {
+            continue;
+        }
+        value <<= 1;
+        mask <<= 1;
+        match c {
+            '0' => {
+                mask |= 1;
+            }
+            '1' => {
+                value |= 1;
+                mask |= 1;
+            }
+            '?' | 'x' | 'X' | 'z' | 'Z' => { /* care bit stays 0 */ }
+            _ => return None,
+        }
+    }
+    Some((value, mask))
+}
+
+fn parse_hex_literal_with_mask(digits: &str) -> Option<(i64, i64)> {
+    let mut value: i64 = 0;
+    let mut mask: i64 = 0;
+    for c in digits.chars() {
+        if c == '_' {
+            continue;
+        }
+        value <<= 4;
+        mask <<= 4;
+        match c {
+            '0'..='9' | 'a'..='f' | 'A'..='F' => {
+                value |= c.to_digit(16)? as i64;
+                mask |= 0xF;
+            }
+            '?' | 'x' | 'X' | 'z' | 'Z' => { /* care nibble stays 0 */ }
+            _ => return None,
+        }
+    }
+    Some((value, mask))
 }
