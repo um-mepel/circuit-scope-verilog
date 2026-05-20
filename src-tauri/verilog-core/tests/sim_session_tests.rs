@@ -742,3 +742,108 @@ endmodule
     assert_eq!(valid & 0x1, 1, "non-zero input must assert valid");
 }
 
+
+/// Multi-statement task body: tests that a task body containing several
+/// blocking assigns is spliced in full at the call site (block-splicing
+/// implementation). Each call to `seed()` should update three module-level
+/// regs.
+#[test]
+fn task_with_multi_statement_body_splices_each_assignment() {
+    let src = r#"
+module dut(input clk, input rst_n, output reg [7:0] a, output reg [7:0] b, output reg [7:0] c);
+  task seed;
+    input [7:0] x;
+    begin
+      a = x;
+      b = x + 8'd1;
+      c = x + 8'd2;
+    end
+  endtask
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      a <= 8'd0; b <= 8'd0; c <= 8'd0;
+    end else begin
+      seed(8'd10);
+    end
+  end
+endmodule
+
+module multi_task_tb;
+  reg clk, rst_n;
+  wire [7:0] a, b, c;
+  dut u(.clk(clk), .rst_n(rst_n), .a(a), .b(b), .c(c));
+  initial begin
+    clk = 0; rst_n = 0;
+    #7 rst_n = 1;
+    #20 $finish;
+  end
+  always #5 clk = ~clk;
+endmodule
+"#;
+    let mut proj = build_ir_for_file("task_multi.v", src);
+    optimize_project(&mut proj);
+    let config = SimConfig {
+        top_module: "multi_task_tb".into(),
+        num_cycles: 4,
+        ..Default::default()
+    };
+    let tmp = tempdir().unwrap();
+    let vcd_path: PathBuf = tmp.path().join("task_multi.vcd");
+    let mut sess = SimSession::start(&proj, config, vcd_path).unwrap();
+    sess.step(StepMode::ToEnd, None);
+
+    let (a, _, _) = sess.eval_signal_resolved("a").expect("a resolvable");
+    let (b, _, _) = sess.eval_signal_resolved("b").expect("b resolvable");
+    let (c, _, _) = sess.eval_signal_resolved("c").expect("c resolvable");
+    // The task fires every posedge after rst_n release. Final values:
+    assert_eq!(a & 0xFF, 10, "a = x = 10");
+    assert_eq!(b & 0xFF, 11, "b = x + 1 = 11");
+    assert_eq!(c & 0xFF, 12, "c = x + 2 = 12");
+}
+
+/// Multi-statement function body: tests the let-binding semantics where
+/// intermediate assignments become substitutions for subsequent statements.
+/// `saturate` computes `(x + 1)` into a local `tmp`, then uses `tmp` in the
+/// final return expression.
+#[test]
+fn function_with_let_bindings_substitutes_intermediates() {
+    let src = r#"
+module m(input [9:0] x, output [7:0] y);
+  function [7:0] saturate;
+    input [9:0] x;
+    reg [9:0] tmp;
+    begin
+      tmp = x + 10'd1;
+      saturate = (tmp > 10'd255) ? 8'hFF : tmp[7:0];
+    end
+  endfunction
+  assign y = saturate(x);
+endmodule
+
+module func_let_tb;
+  reg [9:0] x;
+  wire [7:0] y;
+  m dut(.x(x), .y(y));
+  initial begin
+    x = 10'd100; #10;  // saturate(100) -> tmp=101 -> y=101
+    x = 10'd255; #10;  // saturate(255) -> tmp=256 -> y=0xFF (255 < 256, condition true)
+    x = 10'd500; #10;  // saturate(500) -> tmp=501 -> y=0xFF
+    #10 $finish;
+  end
+endmodule
+"#;
+    let mut proj = build_ir_for_file("func_let.v", src);
+    optimize_project(&mut proj);
+    let config = SimConfig {
+        top_module: "func_let_tb".into(),
+        num_cycles: 4,
+        ..Default::default()
+    };
+    let tmp = tempdir().unwrap();
+    let vcd_path: PathBuf = tmp.path().join("func_let.vcd");
+    let mut sess = SimSession::start(&proj, config, vcd_path).unwrap();
+    sess.step(StepMode::ToEnd, None);
+
+    let (y, _, _) = sess.eval_signal_resolved("y").expect("y resolvable");
+    assert_eq!(y & 0xFF, 0xFF, "saturate(500) clamps to 0xFF");
+}

@@ -1196,6 +1196,16 @@ fn lower_stmt_block(
     let mut out = StmtBlock::with_capacity(stmts.len());
     for (s, (start, end)) in stmts.into_iter().zip(ranges.into_iter()) {
         let span = Span::new(file_id, start, end);
+        // Block (from an inlined multi-statement task body): recursively
+        // lower the inner block and splice each resulting statement into
+        // this stream so the caller's IR is flat.
+        if let CstStmt::Block(inner) = s {
+            let lowered = lower_stmt_block(inner, mem_stems, locals, net_widths, file_id);
+            for (ir, sp) in lowered.iter_with_spans() {
+                out.push(ir.clone(), sp);
+            }
+            continue;
+        }
         // Concat-LHS (`{a, b, c} = rhs;`) lowers to multiple per-component
         // assignments; expand inline so each lands as its own statement
         // sharing the source span of the original concat.
@@ -1782,6 +1792,8 @@ fn lower_stmt(
                 .map(|e| lower_expr(e, mem_stems, locals))
                 .collect(),
         }),
+        // Block is spliced by `lower_stmt_block` before reaching here.
+        CstStmt::Block(_) => None,
     }
 }
 

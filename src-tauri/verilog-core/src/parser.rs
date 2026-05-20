@@ -263,6 +263,12 @@ pub enum CstStmt {
     },
     Delay(DelayRational),
     SystemTask { name: String, args: Vec<Expr> },
+    /// `begin … end` group of statements. Created when inlining a multi-
+    /// statement task body at a call site — the call site can return a
+    /// single `CstStmt::Block`, and `lower_stmt_block` splices its
+    /// contents into the parent stream so the simulator never sees a
+    /// `Block` IR node.
+    Block(CstBlock),
 }
 
 /// Distinguishes `case` from `casez`/`casex` so the lowering can choose
@@ -374,26 +380,32 @@ pub(crate) fn parse_file(file: &SourceFile, tokens: &[Token]) -> ParseResult {
 }
 
 /// Module-local function declaration captured for inlining at expression
-/// parse time. Only the single-assignment body form
-/// `begin name = <expr>; end` is currently supported; richer bodies are
-/// rejected at declaration time.
+/// parse time. The body is a sequence of blocking assignments: any
+/// non-function-name target acts as a let-binding for subsequent statements;
+/// the last assignment to the function name supplies the return value.
+/// Control flow (`if`/`case`/`for`) inside the body is rejected at parse
+/// time with a diagnostic.
 #[derive(Debug, Clone)]
 struct FuncDef {
     name: String,
     /// Formal-parameter names, in declaration order.
     args: Vec<String>,
-    /// RHS expression of the single `name = <expr>;` body statement.
-    body_expr: Expr,
+    /// Sequence of `(target_name, rhs_expression)`. Walked at the call
+    /// site to build a substitution map; the final entry whose target
+    /// equals the function name produces the return expression.
+    body_assigns: Vec<(String, Expr)>,
 }
 
 /// Module-local task declaration captured for inlining at statement parse
-/// time. Only single-statement bodies are currently supported; richer bodies
-/// would need block-splicing.
+/// time. The body is an arbitrary `begin … end` block (can contain
+/// conditionals, loops, system tasks, calls to other tasks/functions).
+/// Locals declared between the arg list and `begin` are skipped at parse
+/// time — references to them fall through to enclosing module scope.
 #[derive(Debug, Clone)]
 struct TaskDef {
     name: String,
     args: Vec<String>,
-    body_stmt: CstStmt,
+    body: CstBlock,
 }
 
 struct Parser<'a> {
@@ -1628,7 +1640,11 @@ impl<'a> Parser<'a> {
                         .clone();
                     let subs: Vec<(String, Expr)> =
                         def.args.iter().cloned().zip(actuals.into_iter()).collect();
-                    return Some(subst_stmt_multi(def.body_stmt, &subs));
+                    // Substitute formals throughout the body block, then
+                    // wrap as Block so `lower_stmt_block` splices the
+                    // resulting statements into the caller's stream.
+                    let substituted = subst_block_multi(def.body, &subs);
+                    return Some(CstStmt::Block(substituted));
                 }
                 self.bump();
                 let target = self.parse_assign_target_suffix(reg);
@@ -1727,6 +1743,24 @@ impl<'a> Parser<'a> {
     /// name = <expr>; end endfunction` and stash in [`Self::functions`] for
     /// inlining at expression parse time. Bodies more complex than a single
     /// `name = expr;` are flagged and skipped.
+
+    /// Consume zero or more local declarations inside a task/function body
+    /// (`reg [W:0] x;`, `integer i;`, etc.). We don't track them — references
+    /// resolve via let-binding (functions) or fall through to the enclosing
+    /// module scope (tasks). Stops at the first non-decl token.
+    fn skip_local_decls(&mut self) {
+        loop {
+            if !matches!(
+                self.current().kind,
+                TokenKind::Reg | TokenKind::Wire | TokenKind::Logic | TokenKind::Integer
+            ) {
+                return;
+            }
+            // Skip the entire `<kind> [optional width] name1, name2;` line.
+            self.skip_to_semicolon();
+        }
+    }
+
     fn parse_function_decl(&mut self) {
         self.bump(); // function
         // Optional return width (we only need its presence; widths are
@@ -1778,37 +1812,87 @@ impl<'a> Parser<'a> {
             }
             let _ = self.match_kind(TokenKind::Semicolon);
         }
-        // Body: optional `begin` ... `end` wrapping a single `name = expr;`.
+        // Body: optional `begin` ... `end` wrapping a sequence of blocking
+        // assignments. Each non-function-name target is a let-binding; the
+        // last assignment to the function name supplies the return value.
+        // `reg`/`integer` local decls are accepted between the arg list and
+        // `begin` (skipped — the let-binding model doesn't need storage).
+        self.skip_local_decls();
         let saw_begin = self.match_kind(TokenKind::Begin);
-        // Expect `name = expr;` — the assignment to the function-name carries
-        // the return value.
-        let body_expr = if self.current().kind == TokenKind::Identifier
-            && self.current().lexeme == name
+        // After `begin`, more local decls may appear before the first
+        // statement (matches IEEE 1364 task/function layout).
+        self.skip_local_decls();
+
+        let mut body_assigns: Vec<(String, Expr)> = Vec::new();
+        while self.current().kind != TokenKind::End
+            && self.current().kind != TokenKind::Endfunction
+            && self.current().kind != TokenKind::Eof
         {
-            self.bump();
-            if !self.match_kind(TokenKind::Eq) {
-                self.skip_to_endfunction();
-                return;
+            match self.current().kind {
+                TokenKind::Identifier => {
+                    let target = self.current().lexeme.clone();
+                    self.bump();
+                    if !self.match_kind(TokenKind::Eq) {
+                        self.error_at_current(&format!(
+                            "function `{name}` body: expected `=` after `{target}`"
+                        ));
+                        self.skip_to_semicolon();
+                        continue;
+                    }
+                    let rhs = self.parse_expression(0);
+                    let _ = self.match_kind(TokenKind::Semicolon);
+                    body_assigns.push((target, rhs));
+                }
+                TokenKind::If
+                | TokenKind::Case
+                | TokenKind::Casez
+                | TokenKind::Casex
+                | TokenKind::For => {
+                    self.error_at_current(&format!(
+                        "function `{name}` body: control flow (if/case/for) is not supported                          in this version — express the function as a sequence of `tmp = expr;`                          lines ending with `{name} = expr;`"
+                    ));
+                    // Recover by skipping to end of function.
+                    if saw_begin {
+                        // Skip until matching End so we don't drop endfunction too.
+                        let mut depth: i32 = 1;
+                        while depth > 0 && self.current().kind != TokenKind::Eof {
+                            match self.current().kind {
+                                TokenKind::Begin => depth += 1,
+                                TokenKind::End => depth -= 1,
+                                _ => {}
+                            }
+                            self.bump();
+                        }
+                    } else {
+                        self.skip_to_endfunction();
+                        return;
+                    }
+                    break;
+                }
+                _ => {
+                    self.error_at_current(&format!(
+                        "function `{name}` body: unexpected token, expected `<name> = <expr>;`"
+                    ));
+                    self.skip_to_semicolon();
+                }
             }
-            let e = self.parse_expression(0);
-            let _ = self.match_kind(TokenKind::Semicolon);
-            e
-        } else {
-            // Unsupported richer body — record and skip the rest.
-            self.error_at_current(&format!(
-                "function `{name}` body must be `begin {name} = <expr>; end` for now"
-            ));
-            self.skip_to_endfunction();
-            return;
-        };
+        }
         if saw_begin {
             let _ = self.match_kind(TokenKind::End);
         }
         let _ = self.match_kind(TokenKind::Endfunction);
+
+        if !body_assigns.iter().any(|(t, _)| *t == name) {
+            self.error_at_current(&format!(
+                "function `{name}` body has no assignment to `{name}` — no return value"
+            ));
+            // Fall through and register the (broken) function anyway; calls
+            // will substitute an `Ident(name)` which is at least benign.
+        }
         self.functions.push(FuncDef {
             name,
             args,
-            body_expr,
+            body_assigns,
         });
     }
 
@@ -1862,23 +1946,49 @@ impl<'a> Parser<'a> {
             }
             let _ = self.match_kind(TokenKind::Semicolon);
         }
-        let saw_begin = self.match_kind(TokenKind::Begin);
-        let body_stmt = match self.parse_stmt() {
-            Some(s) => s,
-            None => {
-                self.error_at_current(&format!("task `{name}` body could not be parsed"));
-                self.skip_to_endtask();
-                return;
+        // Task locals declared between the arg list and `begin` — skipped.
+        self.skip_local_decls();
+        // parse_stmt_block handles both bare-statement and begin..end forms.
+        // After consuming a `begin`, it also tolerates further local decls
+        // before the first real statement.
+        let body = if self.current().kind == TokenKind::Begin {
+            self.bump(); // begin
+            if self.current().kind == TokenKind::Colon {
+                self.bump();
+                let _ = self.expect_identifier("expected block name after begin:");
             }
-        };
-        if saw_begin {
+            // Locals between `begin` and the first statement.
+            self.skip_local_decls();
+            let mut block = CstBlock::new();
+            while self.current().kind != TokenKind::End
+                && self.current().kind != TokenKind::Eof
+            {
+                let start = self.cur_start();
+                let before = self.pos;
+                if let Some(stmt) = self.parse_stmt() {
+                    let end = self.last_end();
+                    block.push(stmt, (start, end));
+                } else if self.pos == before {
+                    self.bump();
+                }
+            }
             let _ = self.match_kind(TokenKind::End);
-        }
+            block
+        } else {
+            // Single bare statement form: `task foo; input ...; <stmt>; endtask`
+            let mut block = CstBlock::new();
+            let start = self.cur_start();
+            if let Some(stmt) = self.parse_stmt() {
+                let end = self.last_end();
+                block.push(stmt, (start, end));
+            }
+            block
+        };
         let _ = self.match_kind(TokenKind::Endtask);
         self.tasks.push(TaskDef {
             name,
             args,
-            body_stmt,
+            body,
         });
     }
 
@@ -1928,8 +2038,10 @@ impl<'a> Parser<'a> {
                 } else if self.current().kind == TokenKind::LParen
                     && self.functions.iter().any(|f| f.name == name)
                 {
-                    // Function call — parse actuals, substitute formals,
-                    // return the inlined body expression.
+                    // Function call — parse actuals, then walk the body's
+                    // assignments. Each non-function-name target becomes a
+                    // let-binding added to the substitution map; the latest
+                    // assignment to the function name supplies the return.
                     self.bump(); // (
                     let mut actuals = Vec::new();
                     if self.current().kind != TokenKind::RParen {
@@ -1945,15 +2057,21 @@ impl<'a> Parser<'a> {
                         .find(|f| f.name == name)
                         .expect("function present by name in table")
                         .clone();
-                    // Right-pad / left-truncate to formal arity. Mismatch is
-                    // diagnosed but not fatal — extra actuals are ignored,
-                    // missing ones leave the formal name unbound.
                     let mut subs: Vec<(String, Expr)> =
                         def.args.iter().cloned().zip(actuals.into_iter()).collect();
-                    // If too few actuals, leave the unbound formals unreplaced
-                    // (they'll resolve to the surrounding scope's identifier).
-                    let _ = &mut subs;
-                    subst_expr_multi(def.body_expr, &subs)
+                    let mut return_expr: Option<Expr> = None;
+                    for (target, rhs) in def.body_assigns.into_iter() {
+                        let substituted = subst_expr_multi(rhs, &subs);
+                        if target == def.name {
+                            return_expr = Some(substituted);
+                        } else {
+                            // Remove any earlier binding with the same name
+                            // so subsequent uses pick up the new value.
+                            subs.retain(|(n, _)| n != &target);
+                            subs.push((target, substituted));
+                        }
+                    }
+                    return_expr.unwrap_or(Expr::Ident(def.name))
                 } else {
                     Expr::Ident(name)
                 }
@@ -2341,6 +2459,42 @@ pub(crate) fn subst_stmt_multi(s: CstStmt, subs: &[(String, Expr)]) -> CstStmt {
             name,
             args: args.into_iter().map(|e| subst_expr_multi(e, subs)).collect(),
         },
-        other => other, // IfElse / Case / For — would need recursive walks; OK for now.
+        CstStmt::IfElse { cond, then_body, else_body } => CstStmt::IfElse {
+            cond: subst_expr_multi(cond, subs),
+            then_body: subst_block_multi(then_body, subs),
+            else_body: subst_block_multi(else_body, subs),
+        },
+        CstStmt::Case { kind, expr, arms, default } => CstStmt::Case {
+            kind,
+            expr: subst_expr_multi(expr, subs),
+            arms: arms
+                .into_iter()
+                .map(|a| CaseArm {
+                    value: subst_expr_multi(a.value, subs),
+                    body: subst_block_multi(a.body, subs),
+                })
+                .collect(),
+            default: subst_block_multi(default, subs),
+        },
+        CstStmt::For { init_var, init_val, cond, step_var, step_expr, body } => CstStmt::For {
+            init_var,
+            init_val: subst_expr_multi(init_val, subs),
+            cond: subst_expr_multi(cond, subs),
+            step_var,
+            step_expr: subst_expr_multi(step_expr, subs),
+            body: subst_block_multi(body, subs),
+        },
+        CstStmt::Block(b) => CstStmt::Block(subst_block_multi(b, subs)),
     }
+}
+
+/// Apply `subst_stmt_multi` across every statement in a [`CstBlock`],
+/// preserving the spans the parser captured.
+pub(crate) fn subst_block_multi(b: CstBlock, subs: &[(String, Expr)]) -> CstBlock {
+    let (stmts, ranges) = b.into_parts();
+    let mut out = CstBlock::new();
+    for (stmt, range) in stmts.into_iter().zip(ranges.into_iter()) {
+        out.push(subst_stmt_multi(stmt, subs), range);
+    }
+    out
 }
