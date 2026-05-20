@@ -1,5 +1,5 @@
 cask "circuit-scope" do
-  version "0.2.2"
+  version "0.3.0"
 
   # SHA-256 checksums for the DMG attached to the GitHub Release.
   # Regenerate after each release with:
@@ -8,11 +8,11 @@ cask "circuit-scope" do
   # GitHub Releases normalises the space in Tauri's DMG product name to a dot,
   # so the asset is served at `Circuit.Scope_<ver>_<arch>.dmg`.
   on_arm do
-    sha256 "3d0155d0b193c662dfa47bdb503623ac88fb9add7f601ebcac66e36f49022518"
+    sha256 "0000000000000000000000000000000000000000000000000000000000000000"  # TODO bump-shas.sh
     url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit.Scope_#{version}_aarch64.dmg"
   end
   on_intel do
-    sha256 "5c82c7a7b0241544c89cacabb7e6ebff65557649f865be978cda66c675dc535e"
+    sha256 "0000000000000000000000000000000000000000000000000000000000000000"  # TODO bump-shas.sh
     url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit.Scope_#{version}_x64.dmg"
   end
 
